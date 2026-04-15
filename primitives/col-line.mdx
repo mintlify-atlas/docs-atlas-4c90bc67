@@ -1,0 +1,124 @@
+---
+title: 'CColLine — directed line segment collision primitive'
+description: 'CColLine is a 32-byte directed segment used for ray casts, line-of-sight, bullet travel, and wheel-contact queries in the GTA:SA collision system.'
+---
+
+`CColLine` represents a finite directed line segment from a start point to an end point. Line segments are used extensively in the collision system for sweep tests, line-of-sight checks, bullet travel, and vehicle wheel-contact queries. Because they are cast into the world every frame for many game objects, the struct is padded to a 32-byte, cache-friendly layout rather than the minimal 24-byte footprint two `CVector` values would otherwise occupy.
+
+## Class definition
+
+```cpp col_line.hpp
+class CColLine
+{
+public:
+    CColLine() {}
+    CColLine(const CVector& vecStart, const CVector& vecEnd);
+
+    void Set(const CVector& vecStart, const CVector& vecEnd);
+
+    CVector m_vecStart;   // Start point (12 bytes)
+    u32     m_pad;        // Explicit padding for 16-byte alignment
+    CVector m_vecEnd;     // End point (12 bytes)
+    u32     m_pad2;       // Explicit padding for 16-byte alignment
+};
+CHECK_SIZE_X86(CColLine, 0x20);
+```
+
+## Fields
+
+<ResponseField name="m_vecStart" type="CVector">
+  The origin of the line segment. Three `f32` components — x, y, z.
+</ResponseField>
+
+<ResponseField name="m_pad" type="u32">
+  Explicit padding that follows `m_vecStart`. This pads the first 12-byte vector to a 16-byte slot so that `m_vecEnd` starts at a 16-byte-aligned offset.
+</ResponseField>
+
+<ResponseField name="m_vecEnd" type="CVector">
+  The terminus of the line segment.
+</ResponseField>
+
+<ResponseField name="m_pad2" type="u32">
+  Explicit padding that follows `m_vecEnd`. Brings the total struct size to 32 bytes (0x20), which is a multiple of 16.
+</ResponseField>
+
+<Note>
+  Do not use `m_pad` or `m_pad2` to store any data. They exist solely to ensure each `CVector` field starts at a 16-byte-aligned address, which benefits SIMD loads on x86. Their values are undefined after construction.
+</Note>
+
+## Constructors and methods
+
+<ResponseField name="CColLine()" type="constructor">
+  Default constructor. Leaves all fields uninitialised.
+</ResponseField>
+
+<ResponseField name="CColLine(vecStart, vecEnd)" type="constructor">
+  Constructs the line from two explicit endpoint vectors.
+
+  <ParamField path="vecStart" type="const CVector&" required>
+    Start point of the segment.
+  </ParamField>
+  <ParamField path="vecEnd" type="const CVector&" required>
+    End point of the segment.
+  </ParamField>
+</ResponseField>
+
+<ResponseField name="Set" type="void">
+  Reassigns the start and end points after construction.
+
+  <ParamField path="vecStart" type="const CVector&" required>
+    New start point.
+  </ParamField>
+  <ParamField path="vecEnd" type="const CVector&" required>
+    New end point.
+  </ParamField>
+</ResponseField>
+
+## Usage in the collision system
+
+`CColLine` appears wherever a directed query needs to travel through space and intersect geometry. A few representative call sites:
+
+### ProcessLineSphere
+
+Tests whether a line segment passes through a sphere. Returns the closest intersection depth and populates a `CColPoint` when a hit is found.
+
+```cpp
+// Typical call site in the collision processor
+CColLine line(CVector(0.0f, 0.0f, 5.0f), CVector(0.0f, 0.0f, -1.0f));
+CColSphere sphere;
+sphere.Set(1.0f, CVector(0.0f, 0.0f, 3.0f), SURFACE_TYPE_DEFAULT, 0);
+
+CColPoint hitPoint;
+f32 maxDepth = 1.0f;
+if (ProcessLineSphere(line, sphere, hitPoint, maxDepth))
+{
+    // hitPoint.GetPosition() holds the impact location
+}
+```
+
+### TestLineTriangle
+
+Tests a `CColLine` against a `CColTriangle` given a vertex array. Returns `true` and the parametric distance `t` along the segment if the triangle is hit.
+
+```cpp
+CColLine query(vehiclePos, vehiclePos + CVector(0.0f, 0.0f, -2.0f));
+f32 t;
+if (TestLineTriangle(query, vertices, triangle, t))
+{
+    // ground contact at vehiclePos + t * direction
+}
+```
+
+### Wheel contact and line-of-sight
+
+Every physics tick, four `CColLine` instances are cast downward from each wheel hub to find the road surface. The same primitive is used for camera-to-target line-of-sight checks, where an unobstructed segment means the camera has a clear view.
+
+## Memory layout
+
+| Field | Offset | Size | Description |
+|-------|--------|------|-------------|
+| `m_vecStart` | `0x00` | 12 bytes | Start point |
+| `m_pad` | `0x0C` | 4 bytes | Alignment padding |
+| `m_vecEnd` | `0x10` | 12 bytes | End point |
+| `m_pad2` | `0x1C` | 4 bytes | Alignment padding |
+| **Total** | — | **32 bytes** | `CHECK_SIZE_X86(CColLine, 0x20)` |

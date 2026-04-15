@@ -1,97 +1,73 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "GTA:SA Collision: C++ Collision Detection Reference"
+description: "Reverse-engineered C++ collision detection system from Grand Theft Auto: San Andreas. Covers primitives, models, physics, and spatial acceleration."
 ---
 
-## Setting up
+GTA:SA Collision is a reverse-engineered C++ implementation of the collision detection subsystem used in Grand Theft Auto: San Andreas. It documents the full hierarchy of collision primitives, model management classes, physical simulation, and spatial storage systems that power object interactions in the game engine.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Introduction" icon="book-open" href="/introduction">
+    Learn what this codebase covers and how the collision system is organized.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Architecture overview" icon="diagram-project" href="/architecture">
+    Understand the class hierarchy, data flow, and memory layout of the system.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Collision primitives" icon="shapes" href="/primitives/col-sphere">
+    Sphere, box, line, triangle, and collision point types with surface metadata.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Detection & physics" icon="atom" href="/detection/collision-class">
+    The CCollision class, CPhysical base, line-of-sight, and camera collision.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## Explore by topic
 
-Everything you need to create world-class documentation.
+<CardGroup cols={3}>
+  <Card title="CColSphere" icon="circle" href="/primitives/col-sphere">
+    Sphere collision primitive with ray/edge/point intersection tests.
+  </Card>
+  <Card title="CColBox" icon="cube" href="/primitives/col-box">
+    Axis-aligned bounding box collision primitive.
+  </Card>
+  <Card title="CColTriangle" icon="triangle" href="/primitives/col-triangle">
+    Triangle mesh primitive with compressed plane normals.
+  </Card>
+  <Card title="CColModel" icon="layer-group" href="/models/col-model">
+    Container for all collision volumes attached to a model.
+  </Card>
+  <Card title="CCollisionData" icon="database" href="/models/collision-data">
+    Low-level collision volume arrays — spheres, boxes, triangles, lines.
+  </Card>
+  <Card title="CPhysical" icon="wind" href="/detection/physical">
+    Base class for all physically simulated entities.
+  </Card>
+  <Card title="CColStore" icon="hard-drive" href="/storage/col-store">
+    Streaming collision files in and out of memory with quad-tree indexing.
+  </Card>
+  <Card title="CColAccel" icon="bolt" href="/storage/col-accel">
+    Collision caching and IPL entity acceleration structures.
+  </Card>
+  <Card title="Compressed floats" icon="compress" href="/internals/compressed-float">
+    Memory-efficient fixed-point encoding for collision normals and vectors.
+  </Card>
+</CardGroup>
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+## System overview
 
-## Need inspiration?
-
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<Steps>
+  <Step title="Collision primitives">
+    Every collidable surface is described by one of four primitive types: `CColSphere`, `CColBox`, `CColLine`, or `CColTriangle`. Each primitive carries a `ColData` struct storing surface type, piece type, and lighting.
+  </Step>
+  <Step title="Collision models">
+    Primitives are collected into a `CCollisionData` object, which is owned by a `CColModel`. A `CColModel` also holds a `CBoundingBox` for broad-phase culling before testing individual primitives.
+  </Step>
+  <Step title="Detection methods">
+    The static `CCollision` class provides all test and process functions. Test functions return a bool; process functions additionally compute the `CColPoint` (position, normal, surface metadata, depth) and a collision ratio.
+  </Step>
+  <Step title="Physical simulation">
+    `CPhysical` extends `CEntity` with mass, velocity, friction, and elasticity. It calls into `CCollision` during `ProcessCollision()` and applies impulses via `ApplyCollision()` and `ApplySpringCollision()`.
+  </Step>
+  <Step title="Streaming">
+    `CColStore` manages named `.col` file slots backed by a quad-tree. It loads collision data on demand as the player moves through the world. `CColAccel` caches collision models to speed up repeated loads.
+  </Step>
+</Steps>

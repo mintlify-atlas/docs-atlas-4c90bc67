@@ -1,0 +1,186 @@
+---
+title: "CCollisionData: primitive arrays and shadow geometry"
+description: "CCollisionData stores sphere, box, line/disk, and compressed triangle arrays for one model, plus optional shadow triangles and per-section bounding data."
+---
+
+`CCollisionData` is the inner payload of a `CColModel`. It owns heap pointers to each category of collision primitive and carries the count and flag state that controls how those primitives are interpreted. All pointer lifetimes are managed by the owning `CColModel` — never free individual arrays directly unless you are also resetting the counts.
+
+## Class definition and field layout
+
+```cpp
+class CCollisionData
+{
+public:
+    i16 m_nNoOfSpheres;    // 0x00
+    i16 m_nNoOfBoxes;      // 0x02
+    i16 m_nNoOfTriangles;  // 0x04
+    union {
+        i8 m_nNoOfLines;   // 0x06
+        i8 m_nNoOfDisks;   // 0x06
+    };
+
+    u8 m_useDisksNotLines    : 1;  // 0x07
+    u8 m_useColModelSections : 1;
+    u8 m_hasShadowTris       : 1;
+
+    CColSphere*          m_pSphereArray;               // 0x08
+    CColBox*             m_pBoxArray;                  // 0x0C
+    union {
+        CColLine*        m_pLineArray;                 // 0x10
+        CColDisk*        m_pDiskArray;                 // 0x10
+    };
+    CollisionVector*     m_pTriCompressedVectorArray;  // 0x14
+    CColTriangle*        m_pTriangleArray;             // 0x18
+    CColTrianglePlane*   m_pTrianglePlaneArray;        // 0x1C
+
+    i32 m_nNoOfShadTriangles;           // 0x20
+    i32 m_nNoOfShadTriangleVerts;       // 0x24
+
+    CollisionVector*  m_pTriCompressedShadVectorArray; // 0x28
+    CColTriangle*     m_pShadTriangleArray;            // 0x2C
+};
+CHECK_SIZE_X86(CCollisionData, 0x30);
+```
+
+## Field offsets (x86)
+
+| Field | Offset | Type |
+|---|---|---|
+| `m_nNoOfSpheres` | `0x00` | `i16` |
+| `m_nNoOfBoxes` | `0x02` | `i16` |
+| `m_nNoOfTriangles` | `0x04` | `i16` |
+| `m_nNoOfLines` / `m_nNoOfDisks` | `0x06` | `i8` (union) |
+| `m_pSphereArray` | `0x08` | `CColSphere*` |
+| `m_pBoxArray` | `0x0C` | `CColBox*` |
+| `m_pLineArray` / `m_pDiskArray` | `0x10` | pointer union |
+| `m_pTriCompressedVectorArray` | `0x14` | `CollisionVector*` |
+| `m_pTriangleArray` | `0x18` | `CColTriangle*` |
+| `m_pTrianglePlaneArray` | `0x1C` | `CColTrianglePlane*` |
+| `m_nNoOfShadTriangles` | `0x20` | `i32` |
+| `m_nNoOfShadTriangleVerts` | `0x24` | `i32` |
+| `m_pTriCompressedShadVectorArray` | `0x28` | `CollisionVector*` |
+| `m_pShadTriangleArray` | `0x2C` | `CColTriangle*` |
+
+## Bit flags
+
+<ResponseField name="m_useDisksNotLines" type="u8 : 1">
+  When set, `m_pDiskArray` and `m_nNoOfDisks` are active; when clear, `m_pLineArray` and `m_nNoOfLines` are active. This flag selects which branch of the union is meaningful. WDMOBILE targets use disk primitives; the standard PC/console build uses line segments.
+</ResponseField>
+
+<ResponseField name="m_useColModelSections" type="u8 : 1">
+  When set, `CColModelSection` entries and a section count are stored immediately before `m_pTriangleArray` in memory. Access them through `GetNoOfColModelSections()` and `GetColModelSection(i)`.
+</ResponseField>
+
+<ResponseField name="m_hasShadowTris" type="u8 : 1">
+  When set, the shadow triangle arrays (`m_pShadTriangleArray`, `m_pTriCompressedShadVectorArray`) are populated and valid. Shadow triangles use the same `CColTriangle` structure but project a separate mesh for stencil shadows rather than collision response.
+</ResponseField>
+
+## Primitive arrays
+
+### Spheres
+
+```cpp
+i32       GetNoOfSpheres();
+CColSphere& GetSphere(i32 index);
+```
+
+Sphere count is stored as `i16` (`m_nNoOfSpheres`). Each `CColSphere` is 0x14 bytes: a `CSphere` (centre + radius) plus a `ColData` (surface type, piece type, lighting).
+
+### Boxes
+
+```cpp
+i32     GetNoOfBoxes() { return m_nNoOfBoxes; }
+// No GetBox accessor — access m_pBoxArray directly.
+```
+
+Each `CColBox` is 0x1C bytes: a `CBox` (min + max vectors) plus a `ColData`.
+
+### Lines and disks
+
+```cpp
+i32       GetNoOfLines();
+CColLine& GetLine(i32 index);
+
+i32       GetNoOfDisks();
+CColDisk& GetDisk(i32 index);
+```
+
+`m_nNoOfLines` and `m_nNoOfDisks` share the same `i8` at offset `0x06`. Check `m_useDisksNotLines` to know which interpretation applies. `CColLine` is 0x20 bytes (start + padding + end + padding). `CColDisk` is 0x24 bytes and extends `CColSphere` with a thickness vector and scalar.
+
+### Triangles and compressed vertices
+
+```cpp
+i32 GetNoOfTriangles() { return m_nNoOfTriangles; }
+void GetTrianglePoint(CVector& pt, i32 index) const;
+```
+
+Triangle vertices are stored as `CollisionVector` (a compressed fixed-point format, see [Compressed floats](/internals/compressed-float)). `GetTrianglePoint` converts a vertex from the compressed array to world-space floats by dividing each component by `128.0f`:
+
+```cpp
+pt.x = m_pTriCompressedVectorArray[index].x / 128.0f;
+pt.y = m_pTriCompressedVectorArray[index].y / 128.0f;
+pt.z = m_pTriCompressedVectorArray[index].z / 128.0f;
+```
+
+Each `CColTriangle` stores three vertex indices (`u16` on PC, `i32` on WDMOBILE), plus surface type and lighting bytes.
+
+## Shadow triangles
+
+```cpp
+void GetShadTrianglePoint(CVector& pt, i32 index) const;
+```
+
+Shadow triangles mirror the collision triangle interface but drive stencil shadow projection. The decompression formula is identical — divide by `128.0f`. `m_nNoOfShadTriangleVerts` holds the number of compressed vertex entries (not the number of triangles). Both arrays are freed by `RemoveCollisionVolumes()` when `m_hasShadowTris` is set.
+
+## Triangle plane management
+
+```cpp
+void CCollisionData::CalculateTrianglePlanes();
+void CCollisionData::RemoveTrianglePlanes();
+```
+
+`CalculateTrianglePlanes` allocates `(m_nNoOfTriangles + 1) × sizeof(CColTrianglePlane)` bytes and calls `CColTrianglePlane::Set` for every triangle, deriving the compressed normal and principal-axis index from the vertex data. The extra entry (`+1`) is reserved for the link pointer used by `SetLinkPtr` / `GetLinkPtr`.
+
+`RemoveTrianglePlanes` frees `m_pTrianglePlaneArray` and sets the pointer to `nullptr`. This is always called before freeing the main block in the single-allocation path.
+
+## RemoveCollisionVolumes
+
+```cpp
+void CCollisionData::RemoveCollisionVolumes();
+```
+
+Frees every non-null array pointer (`m_pSphereArray`, `m_pLineArray`, `m_pBoxArray`, `m_pTriCompressedVectorArray`, `m_pTriangleArray`, `m_pShadTriangleArray`, `m_pTriCompressedShadVectorArray`) via `CMemoryMgr::Free`, then delegates to `CCollision::RemoveTrianglePlanes` for the plane array. After freeing, all counts are zeroed and all pointers are set to `nullptr`.
+
+## Copy
+
+```cpp
+CCollisionData& CCollisionData::Copy(const CCollisionData& cCol);
+```
+
+Performs a smart deep copy. For each category, if the destination already has the same count it reuses the existing allocation and overwrites the elements; otherwise it frees the old buffer and allocates a fresh one. The triangle copy also recomputes the maximum vertex index across all triangles to determine how many compressed vector entries to copy. Call this via `CColModel::MakeMultipleAlloc()` when you need to convert a streaming single-allocation model into an independently owned model.
+
+## Collision model sections
+
+```cpp
+i32 GetNoOfColModelSections();
+const CColModelSection& GetColModelSection(i32 i);
+```
+
+When `m_useColModelSections` is set, `CColModelSection` entries and a `u32` section count are packed into memory immediately **before** `m_pTriangleArray`. The layout from the triangle array pointer working backwards is:
+
+```
+[... section N] [... section 1] [section 0] [u32 count] [triangle array →]
+```
+
+`GetNoOfColModelSections` reads the count by casting `(m_pTriangleArray - sizeof(u32))` to `u32*`. `GetColModelSection(i)` indexes backwards from there using negative-index arithmetic:
+
+```cpp
+return *reinterpret_cast<CColModelSection*>(
+    reinterpret_cast<u8*>(m_pTriangleArray)
+    - sizeof(u32)
+    - (i + 1) * sizeof(CColModelSection));
+```
+
+<Note>
+  This negative-indexing trick is a WDMOBILE-specific layout. On x86 builds `m_useColModelSections` is always `false` and these methods return `0` / undefined. Do not call them outside of platform-conditioned code.
+</Note>

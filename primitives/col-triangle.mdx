@@ -1,0 +1,225 @@
+---
+title: 'CColTriangle and CColTrianglePlane — mesh primitives'
+description: 'Triangle mesh primitives for GTA:SA collision: CColTriangle stores vertex indices and surface data; CColTrianglePlane stores compressed plane normals.'
+---
+
+Triangles are the foundation of mesh-based collision in GTA:SA. `CColTriangle` stores three vertex indices into a shared vertex array along with surface metadata. `CColTrianglePlane` stores the pre-computed plane equation for that triangle in a compressed form to keep memory use low. Two serialization structs, `CSerializedColTriangle` and `CSerializedColTrianglePlane`, mirror these layouts exactly for binary file I/O.
+
+## Principal axis constants
+
+Each triangle plane caches its _dominant_ normal axis so the collision processor can skip two of the three axis projections during point-in-triangle tests.
+
+| Constant | Value | Meaning |
+|----------|-------|---------|
+| `COLTRIANGLE_AXIS_POSX` | 0 | Normal is most aligned with +X |
+| `COLTRIANGLE_AXIS_NEGX` | 1 | Normal is most aligned with −X |
+| `COLTRIANGLE_AXIS_POSY` | 2 | Normal is most aligned with +Y |
+| `COLTRIANGLE_AXIS_NEGY` | 3 | Normal is most aligned with −Y |
+| `COLTRIANGLE_AXIS_POSZ` | 4 | Normal is most aligned with +Z |
+| `COLTRIANGLE_AXIS_NEGZ` | 5 | Normal is most aligned with −Z |
+
+The principal axis is computed once when `CColTrianglePlane::Set()` builds the plane and is stored in `m_nPrincipalAxis`.
+
+---
+
+## CColTriangle
+
+`CColTriangle` indexes three vertices from a separate `CColPoint` or `CollisionVector` array and stores the triangle's surface type and lighting.
+
+```cpp col_triangle.hpp
+class CColTriangle
+{
+public:
+    u16 m_nIndex1;       // Index of vertex 1 in the shared array
+    u16 m_nIndex2;       // Index of vertex 2
+    u16 m_nIndex3;       // Index of vertex 3
+    u8  m_nSurfaceType;  // Material surface ID
+    u8  m_nLighting;     // Packed day/night lighting nibbles
+
+    void Set(i32 index1, i32 index2, i32 index3,
+             u8 nSurfaceType, u8 nLighting);
+
+    static f32 CalculateLighting(u8 light, f32 Scale);
+};
+```
+
+<Note>
+  On the WD Mobile platform the three index fields are `i32` (4 bytes each) instead of `u16`. All other platforms use `u16`, limiting a single mesh to 65,535 unique vertices.
+</Note>
+
+### Fields
+
+<ResponseField name="m_nIndex1 / m_nIndex2 / m_nIndex3" type="u16">
+  Zero-based indices into the object's shared vertex position array. The three vertices must be wound counter-clockwise when viewed from the outside.
+</ResponseField>
+
+<ResponseField name="m_nSurfaceType" type="u8">
+  Surface material identifier. Determines friction, restitution, audio events, and particle effects when another primitive contacts this triangle.
+</ResponseField>
+
+<ResponseField name="m_nLighting" type="u8">
+  Packed lighting byte: bits 0–3 hold the day brightness (0–15), bits 4–7 hold the night brightness (0–15).
+</ResponseField>
+
+### Methods
+
+<ResponseField name="Set" type="void">
+  Assigns all three vertex indices and the surface metadata.
+
+  <ParamField path="index1" type="i32" required>First vertex index.</ParamField>
+  <ParamField path="index2" type="i32" required>Second vertex index.</ParamField>
+  <ParamField path="index3" type="i32" required>Third vertex index.</ParamField>
+  <ParamField path="nSurfaceType" type="u8" required>Material surface ID.</ParamField>
+  <ParamField path="nLighting" type="u8" required>Packed day/night lighting byte.</ParamField>
+</ResponseField>
+
+<ResponseField name="CalculateLighting" type="static f32">
+  Decodes the packed lighting byte and blends the day and night values according to the current global day/night balance parameter.
+
+  <ParamField path="light" type="u8" required>
+    The packed lighting byte from `m_nLighting`.
+  </ParamField>
+  <ParamField path="Scale" type="f32" required>
+    A per-object scale that maps the 0–15 nibble range into a world luminance value.
+  </ParamField>
+
+  The function body, directly from the source:
+
+  ```cpp col_triangle.hpp
+  // func: sa 0x59F0C0
+  inline f32 CColTriangle::CalculateLighting(u8 light, f32 Scale)
+  {
+      i32 day   = light & 0xF;           // lower nibble
+      i32 night = (light >> 4) & 0xF;   // upper nibble
+
+      f32 fDay   = static_cast<f32>(day)   * Scale / 15.0f;
+      f32 fNight = static_cast<f32>(night) * Scale / 15.0f;
+
+      f32 dnBalance = cbrGetDayNightBalanceParam(); // 0.0 = full day, 1.0 = full night
+
+      return fDay * (1.0f - dnBalance) + (fNight * dnBalance);
+  }
+  ```
+
+  Both day and night values are normalized to `[0, Scale]` by dividing by 15 (the maximum nibble value). The result is a linear blend weighted by the game's global day/night balance.
+</ResponseField>
+
+---
+
+## CColTrianglePlane
+
+`CColTrianglePlane` stores the pre-computed plane equation for a triangle. The normal is stored as a `CollisionVector` (a `CompressedVector` backed by three `i16` values), and the plane offset is a `CollisionFloat` (also `i16`). This compresses the standard 16-byte float plane down to 7 bytes.
+
+```cpp col_triangle.hpp
+class CColTrianglePlane
+{
+public:
+    CollisionVector m_compressedNormal;       // i16 x, y, z
+    CollisionFloat  m_compressedNormalOffset; // i16 plane offset
+
+    u8 m_nPrincipalAxis;  // COLTRIANGLE_AXIS_* constant
+
+    void Set(const CollisionVector* aVectors, CColTriangle& tri);
+
+    void    GetNormal(CVector& normal) const;
+    f32     GetNormalX()      const;
+    f32     GetNormalY()      const;
+    f32     GetNormalZ()      const;
+    f32     GetNormalOffset() const;
+};
+CHECK_SIZE_X86(CColTrianglePlane, 0xA);
+```
+
+### Compression and decompression
+
+Normal components are compressed with a scale factor of 4096. The offset uses a scale factor of 128 (matching the `DecompressTranslationFloat16` convention).
+
+```cpp compressed_float.hpp
+// Compress a normal component:
+CompressedFloat CompressNormalFloat(f32 f)
+{
+    return static_cast<CompressedFloat>(f * 4096.0f);
+}
+
+// Decompress — used by GetNormalX/Y/Z:
+f32 GetNormalX() const { return m_compressedNormal.x / 4096.0f; }
+f32 GetNormalY() const { return m_compressedNormal.y / 4096.0f; }
+f32 GetNormalZ() const { return m_compressedNormal.z / 4096.0f; }
+
+// Decompress offset — used by GetNormalOffset:
+f32 GetNormalOffset() const { return m_compressedNormalOffset / 128.0f; }
+```
+
+### Fields
+
+<ResponseField name="m_compressedNormal" type="CollisionVector">
+  The triangle's unit normal encoded as three `i16` values scaled by 4096. Decompress with `GetNormalX/Y/Z()`.
+</ResponseField>
+
+<ResponseField name="m_compressedNormalOffset" type="CollisionFloat">
+  The plane equation offset `d` in `dot(n, p) = d`, encoded as an `i16` scaled by 128. Decompress with `GetNormalOffset()`.
+</ResponseField>
+
+<ResponseField name="m_nPrincipalAxis" type="u8">
+  One of the `COLTRIANGLE_AXIS_*` constants. Identifies the world axis most closely aligned with the triangle normal, used to choose the projection plane for 2D point-in-triangle tests.
+</ResponseField>
+
+### Methods
+
+<ResponseField name="Set" type="void">
+  Builds the plane equation from the three vertices referenced by `tri`, compresses the result, and stores the principal axis.
+
+  <ParamField path="aVectors" type="const CollisionVector*" required>
+    Pointer to the mesh's shared vertex array.
+  </ParamField>
+  <ParamField path="tri" type="CColTriangle&" required>
+    The triangle whose indices index into `aVectors`.
+  </ParamField>
+</ResponseField>
+
+<ResponseField name="GetNormal" type="void">
+  Decompresses all three normal components into a `CVector`.
+
+  <ParamField path="normal" type="CVector&" required>Output vector.</ParamField>
+</ResponseField>
+
+---
+
+## Serialization structs
+
+These plain structs mirror the on-disk layout of triangle data in `.col` files. A `Fixup()` method (referenced but not shown) patches raw pointers after loading.
+
+### CSerializedColTriangle
+
+```cpp col_triangle.hpp
+struct CSerializedColTriangle
+{
+    u16 m_nIndex1;
+    u16 m_nIndex2;
+    u16 m_nIndex3;
+    u8  m_nSurfaceType;
+    u8  m_nLighting;
+};
+```
+
+Identical field layout to `CColTriangle` on non-mobile platforms. The `Fixup()` method converts this struct in-place to a live `CColTriangle`.
+
+### CSerializedColTrianglePlane
+
+```cpp col_triangle.hpp
+struct CSerializedColTrianglePlane
+{
+    CompressedVector m_compressedNormal;
+    CompressedFloat  m_compressedNormalOffset;
+    u8               m_nPrincipalAxis;
+};
+```
+
+Identical to `CColTrianglePlane`. The `Fixup()` method converts this struct in-place to a live `CColTrianglePlane`.
+
+## Memory layout
+
+| Type | Size (x86) | Notes |
+|------|-----------|-------|
+| `CColTriangle` | 8 bytes | Three `u16` indices (6) + two `u8` fields (2) |
+| `CColTrianglePlane` | `0xA` (10 bytes) | `CollisionVector` (6) + `CollisionFloat` (2) + `u8` (1) + 1 byte padding |

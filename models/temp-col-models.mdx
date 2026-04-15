@@ -1,0 +1,166 @@
+---
+title: "CTempColModels: pre-allocated shared collision models"
+description: "CTempColModels holds static CColModel instances for peds, vehicle parts, weapons, and cut objects, reused each frame to avoid per-tick allocation overhead."
+---
+
+GTA:SA frequently needs to perform collision queries against entities whose geometry changes at runtime — for example, a vehicle door that has just been detached, or a pedestrian that is being knocked over. Rather than allocate and free a `CColModel` on every physics tick, the engine maintains a pool of pre-allocated shared models in `CTempColModels`. These models are populated by the relevant simulation code before each use and should never be held across frames or between calls.
+
+## Class overview
+
+```cpp
+class CTempColModels
+{
+public:
+    static void Initialise();
+    static void Shutdown();
+
+    static CColModel ms_colModelBBox;
+    static CColModel ms_colModelCutObj[20];
+
+    static CColModel ms_colModelPed1;
+    static CColModel ms_colModelPed2;
+
+    static CColModel ms_colModelDoor1;
+    static CColModel ms_colModelBumper1;
+    static CColModel ms_colModelPanel1;
+    static CColModel ms_colModelBonnet1;
+    static CColModel ms_colModelBoot1;
+    static CColModel ms_colModelWheel1;
+
+    static CColModel ms_colModelBodyPart1;
+    static CColModel ms_colModelBodyPart2;
+    static CColModel ms_colModelWeapon;
+};
+ENSURE_STATIC_CLASS(CTempColModels);
+```
+
+`ENSURE_STATIC_CLASS` is a compile-time assertion that verifies the class has no instance members and cannot be instantiated. All state lives in the static members.
+
+## Initialise and Shutdown
+
+```cpp
+static void CTempColModels::Initialise();
+static void CTempColModels::Shutdown();
+```
+
+`Initialise` is called during game startup to allocate collision data for each static model. `Shutdown` calls `RemoveCollisionVolumes()` on every model in a fixed order, freeing all sub-arrays:
+
+```cpp
+void CTempColModels::Shutdown()
+{
+    ms_colModelBBox.RemoveCollisionVolumes();
+    ms_colModelPed1.RemoveCollisionVolumes();
+    ms_colModelPed2.RemoveCollisionVolumes();
+    ms_colModelDoor1.RemoveCollisionVolumes();
+    ms_colModelBumper1.RemoveCollisionVolumes();
+    ms_colModelPanel1.RemoveCollisionVolumes();
+    ms_colModelBonnet1.RemoveCollisionVolumes();
+    ms_colModelBoot1.RemoveCollisionVolumes();
+    ms_colModelWheel1.RemoveCollisionVolumes();
+    ms_colModelBodyPart1.RemoveCollisionVolumes();
+    ms_colModelBodyPart2.RemoveCollisionVolumes();
+    ms_colModelWeapon.RemoveCollisionVolumes();
+
+    for (usize i = 0; i < ARRAY_SIZE(ms_colModelCutObj); ++i)
+        ms_colModelCutObj[i].RemoveCollisionVolumes();
+}
+```
+
+The `ms_colModelCutObj` array is iterated separately because it has 20 slots, each of which may have independently allocated data.
+
+## Static model inventory
+
+### Generic bounding box
+
+<ResponseField name="ms_colModelBBox" type="CColModel">
+  A generic axis-aligned bounding box model used wherever a simple box test is required without a specific entity type. Simulation code writes the desired box extents into this model before calling collision routines.
+</ResponseField>
+
+### Cut objects
+
+<ResponseField name="ms_colModelCutObj[20]" type="CColModel[20]">
+  An array of 20 slots for cut-object collision models. Cut objects are temporary geometry generated when a soft surface (such as vegetation) is sliced by a fast-moving vehicle or weapon. The engine cycles through the 20 slots in a round-robin fashion so that multiple simultaneous cuts can be in flight without conflicting.
+</ResponseField>
+
+### Pedestrians
+
+<ResponseField name="ms_colModelPed1" type="CColModel">
+  Primary pedestrian collision model. Used for the main body capsule during ragdoll and vehicle-contact tests.
+</ResponseField>
+
+<ResponseField name="ms_colModelPed2" type="CColModel">
+  Secondary pedestrian collision model. Used when two simultaneous pedestrian collision representations are needed in the same physics step, such as during grab or carry interactions.
+</ResponseField>
+
+### Vehicle parts
+
+<ResponseField name="ms_colModelDoor1" type="CColModel">
+  Collision geometry for a detached or articulated vehicle door. Written with the appropriate box extents before each door-impact or detachment query.
+</ResponseField>
+
+<ResponseField name="ms_colModelBumper1" type="CColModel">
+  Collision geometry for a front or rear bumper panel during deformation and detachment.
+</ResponseField>
+
+<ResponseField name="ms_colModelPanel1" type="CColModel">
+  Generic side panel collision geometry used for doors and body panels that do not have a dedicated slot.
+</ResponseField>
+
+<ResponseField name="ms_colModelBonnet1" type="CColModel">
+  Collision geometry for the vehicle bonnet (hood). Used during collision-response deformation checks.
+</ResponseField>
+
+<ResponseField name="ms_colModelBoot1" type="CColModel">
+  Collision geometry for the vehicle boot (trunk lid).
+</ResponseField>
+
+<ResponseField name="ms_colModelWheel1" type="CColModel">
+  Collision geometry for a single wheel. Reused for all four wheel positions by updating the model's bounds and primitive data before each test.
+</ResponseField>
+
+### Body parts and weapons
+
+<ResponseField name="ms_colModelBodyPart1" type="CColModel">
+  First body-part collision model, used when a pedestrian body segment becomes a detached rigid body (e.g. a limb during ragdoll).
+</ResponseField>
+
+<ResponseField name="ms_colModelBodyPart2" type="CColModel">
+  Second body-part slot for cases where two simultaneous body-segment queries are needed.
+</ResponseField>
+
+<ResponseField name="ms_colModelWeapon" type="CColModel">
+  Collision model for a dropped or thrown weapon object. Written with the correct box extents for the current weapon type before each query.
+</ResponseField>
+
+## Usage pattern
+
+Because every model in `CTempColModels` is shared globally, the engine follows a strict populate-then-query pattern:
+
+```cpp
+// Example: testing a detached door against world geometry.
+CColModel& doorModel = CTempColModels::ms_colModelDoor1;
+
+// 1. Set bounds to match the door's current dimensions.
+doorModel.SetBoundRadius(doorRadius);
+doorModel.SetBoundOffset(doorLocalCentre);
+doorModel.SetBoundBoxMin(doorMin);
+doorModel.SetBoundBoxMax(doorMax);
+
+// 2. Populate collision data (sphere, box, or triangle primitives).
+CCollisionData* pData = doorModel.GetCollisionData();
+pData->m_pBoxArray[0].Set(doorMin, doorMax, SURFACE_CAR, PIECE_DOOR, 0xFF);
+
+// 3. Run the collision test immediately.
+CCollision::ProcessColModels(doorModel, worldModel, colPoints, ...);
+
+// 4. Do NOT cache a pointer to doorModel — another system may overwrite it
+//    during the next physics tick.
+```
+
+<Warning>
+  All `CTempColModels` members are shared and modified in place before every use. Never store a pointer or reference to any of these models beyond the immediate scope of a single collision query. Holding a stale pointer and reading it later will give you the data from whatever the engine wrote most recently, not the data you populated.
+</Warning>
+
+<Note>
+  `ms_colModelCutObj` provides 20 independent slots precisely to allow multiple simultaneous cut-object queries. If your code needs more than 20 concurrent cut models, you must allocate dedicated `CColModel` instances instead of relying on the shared pool.
+</Note>

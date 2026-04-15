@@ -1,0 +1,221 @@
+---
+title: 'CSphere, CColSphere, and CColDisk — sphere primitives'
+description: 'Sphere collision primitives in GTA:SA: CSphere holds centre and radius, CColSphere adds ColData metadata, CColDisk adds a thickness extrusion axis.'
+---
+
+Sphere primitives are the simplest and most performance-friendly shapes in the collision system. A `CSphere` defines a volume in world space with a centre point and a radius. `CColSphere` extends that with surface metadata used during collision response. `CColDisk` further adds an extrusion vector and thickness, allowing a flattened disk shape to be represented.
+
+## Class hierarchy
+
+```
+CSphere          (0x10)
+└── CColSphere   (0x14)
+    └── CColDisk (0x24)
+```
+
+## CSphere
+
+`CSphere` is a plain geometric sphere with no collision metadata. It holds a centre position and a radius.
+
+```cpp col_sphere.hpp
+class CSphere
+{
+public:
+    CVector m_vecCentre;   // 3D centre of the sphere (12 bytes)
+    f32     m_fRadius;     // Radius in world units    (4 bytes)
+
+    void Set(f32 fRadius, const CVector& vecCentre);
+};
+CHECK_SIZE_X86(CSphere, 0x10);
+```
+
+### Fields
+
+<ResponseField name="m_vecCentre" type="CVector">
+  The world-space centre of the sphere. Three `f32` components (x, y, z), 12 bytes.
+</ResponseField>
+
+<ResponseField name="m_fRadius" type="f32">
+  The radius of the sphere in world units.
+</ResponseField>
+
+### Methods
+
+<ResponseField name="Set" type="void">
+  Sets the radius and centre in one call.
+
+  <ParamField path="fRadius" type="f32" required>
+    New radius for the sphere.
+  </ParamField>
+  <ParamField path="vecCentre" type="const CVector&" required>
+    New centre position.
+  </ParamField>
+</ResponseField>
+
+---
+
+## CColSphere
+
+`CColSphere` inherits `CSphere` and adds a `ColData` block that carries surface type, piece type, and lighting information used by the collision response system.
+
+```cpp col_sphere.hpp
+class CColSphere : public CSphere
+{
+public:
+    ColData m_data;
+
+    void Set(f32 fRadius, const CVector& vecCentre,
+             u8 nSurfaceType, u8 nPieceType, u8 nLighting = 0xff);
+
+    bool IntersectRay(const CVector& v, const CVector& w,
+                      CVector& v1, CVector& v2) const;
+    bool IntersectEdge(const CVector& start, const CVector& end,
+                       CVector& v1, CVector& v2) const;
+    bool IntersectPoint(const CVector& v) const;
+    bool IntersectSphere(const CColSphere& otherSphere) const;
+};
+CHECK_SIZE_X86(CColSphere, 0x14);
+```
+
+### The ColData block
+
+`ColData` is a compact 3-byte structure embedded into every collidable primitive:
+
+```cpp col_data.hpp
+struct ColData
+{
+    u8 m_nSurfaceType;  // Material surface ID (friction, sound, etc.)
+    u8 m_nPieceType;    // eColPieceType — which part of the object
+    u8 m_lighting;      // Packed day/night lighting nibbles
+};
+CHECK_SIZE_X86(ColData, 0x3);
+```
+
+### Methods
+
+<ResponseField name="Set" type="void">
+  Fully initialises the sphere's geometry and collision metadata.
+
+  <ParamField path="fRadius" type="f32" required>
+    Sphere radius in world units.
+  </ParamField>
+  <ParamField path="vecCentre" type="const CVector&" required>
+    Sphere centre in world space.
+  </ParamField>
+  <ParamField path="nSurfaceType" type="u8" required>
+    Surface material ID. Controls friction coefficients, impact sounds, and particle effects.
+  </ParamField>
+  <ParamField path="nPieceType" type="u8" required>
+    Piece identifier from `eColPieceType`. For vehicles this identifies the body part; for peds it identifies the hit zone.
+  </ParamField>
+  <ParamField path="nLighting" type="u8" default="0xff">
+    Packed lighting byte. Upper nibble is night brightness; lower nibble is day brightness. `0xff` means fully lit.
+  </ParamField>
+</ResponseField>
+
+<ResponseField name="IntersectRay" type="bool">
+  Tests whether an infinite ray intersects this sphere. On a hit, `v1` and `v2` receive the two intersection points.
+
+  <ParamField path="v" type="const CVector&" required>Ray origin.</ParamField>
+  <ParamField path="w" type="const CVector&" required>Ray direction (need not be normalised).</ParamField>
+  <ParamField path="v1" type="CVector&" required>First intersection point (output).</ParamField>
+  <ParamField path="v2" type="CVector&" required>Second intersection point (output).</ParamField>
+</ResponseField>
+
+<ResponseField name="IntersectEdge" type="bool">
+  Tests whether a finite line segment intersects this sphere. On a hit, `v1` and `v2` receive the entry and exit points.
+
+  <ParamField path="start" type="const CVector&" required>Segment start.</ParamField>
+  <ParamField path="end" type="const CVector&" required>Segment end.</ParamField>
+  <ParamField path="v1" type="CVector&" required>Entry point (output).</ParamField>
+  <ParamField path="v2" type="CVector&" required>Exit point (output).</ParamField>
+</ResponseField>
+
+<ResponseField name="IntersectPoint" type="bool">
+  Returns `true` if the given point lies inside (or on the surface of) this sphere.
+
+  <ParamField path="v" type="const CVector&" required>Point to test.</ParamField>
+</ResponseField>
+
+<ResponseField name="IntersectSphere" type="bool">
+  Returns `true` if this sphere overlaps `otherSphere`. The test is a simple radius-sum distance check.
+
+  <ParamField path="otherSphere" type="const CColSphere&" required>The other sphere to test against.</ParamField>
+</ResponseField>
+
+### Example — constructing and setting a CColSphere
+
+```cpp
+#include "game/collision/col_sphere.hpp"
+
+// Create a head-hit sphere for a ped at world position (100, 200, 10)
+CColSphere headSphere;
+headSphere.Set(
+    0.3f,                          // radius in world units
+    CVector(100.0f, 200.0f, 10.0f), // centre
+    SURFACE_TYPE_FLESH,            // surface material
+    COLPOINT_PIECETYPE_PED_SPHERE_HEAD, // piece type
+    0xff                           // fully lit (default)
+);
+
+// Quick overlap check against another sphere
+CColSphere other;
+other.Set(0.5f, CVector(100.0f, 200.0f, 10.2f), 0, 0);
+
+if (headSphere.IntersectSphere(other))
+{
+    // handle collision ...
+}
+```
+
+---
+
+## CColDisk
+
+`CColDisk` extends `CColSphere` with a thickness vector and scalar, representing a flattened disk rather than a full sphere. It is used for thin wheel-like volumes.
+
+```cpp col_sphere.hpp
+class CColDisk : public CColSphere
+{
+public:
+    CVector m_vecThickness;   // Extrusion axis direction
+    f32     m_fThickness;     // Extrusion magnitude
+
+    void Set(f32 fRadius, const CVector& vecCentre,
+             const CVector& vecThickness, f32 fThickness,
+             u8 nSurfaceType, u8 nPieceType, u8 nLighting);
+};
+CHECK_SIZE_X86(CColDisk, 0x24);
+```
+
+### Fields
+
+<ResponseField name="m_vecThickness" type="CVector">
+  Direction vector of the disk extrusion axis.
+</ResponseField>
+
+<ResponseField name="m_fThickness" type="f32">
+  Half-thickness of the disk along `m_vecThickness`.
+</ResponseField>
+
+### Methods
+
+<ResponseField name="Set" type="void">
+  Initialises all disk parameters in a single call.
+
+  <ParamField path="fRadius" type="f32" required>Disk radius.</ParamField>
+  <ParamField path="vecCentre" type="const CVector&" required>Disk centre.</ParamField>
+  <ParamField path="vecThickness" type="const CVector&" required>Extrusion axis direction.</ParamField>
+  <ParamField path="fThickness" type="f32" required>Extrusion magnitude.</ParamField>
+  <ParamField path="nSurfaceType" type="u8" required>Surface material ID.</ParamField>
+  <ParamField path="nPieceType" type="u8" required>Piece type ID.</ParamField>
+  <ParamField path="nLighting" type="u8" required>Packed lighting byte.</ParamField>
+</ResponseField>
+
+## Memory layout
+
+| Class | Size (x86) | Notes |
+|-------|-----------|-------|
+| `CSphere` | `0x10` (16 bytes) | `CVector` (12) + `f32` (4) |
+| `CColSphere` | `0x14` (20 bytes) | Adds `ColData` (3) + 1 byte implicit padding |
+| `CColDisk` | `0x24` (36 bytes) | Adds `CVector` (12) + `f32` (4) |

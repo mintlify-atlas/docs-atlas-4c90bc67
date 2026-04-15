@@ -1,0 +1,343 @@
+---
+title: "CCollision: the central static collision detection class"
+description: "Reference for CCollision — lifecycle, level management, sphere and line tests, distance utilities, model-vs-model processing, and the collision cache."
+---
+
+`CCollision` is the central static class that implements every collision test and process function in the GTA:SA engine. It owns no per-instance state; all methods are `static`, and the class is never instantiated. Callers feed it primitive descriptors and transformation matrices, and it returns boolean hit results plus detailed `CColPoint` output where applicable.
+
+## Lifecycle
+
+These four methods manage the collision system's global state. Call them in order at startup and tear them down symmetrically.
+
+```cpp
+static void Init();
+static void Shutdown();
+static void Update();
+static void LoadCollisionScreen(eLevelName);
+static void LoadCollisionWhenINeedIt(bool);
+```
+
+| Method | Description |
+|--------|-------------|
+| `Init()` | Initialises internal structures and the `ms_colModelCache` link list. |
+| `Shutdown()` | Frees all cached collision data and resets static state. |
+| `Update()` | Called once per game frame to pump streaming and cache eviction. |
+| `LoadCollisionScreen(eLevelName)` | Forces synchronous loading of all collision for the given level — used on level-transition loading screens. |
+| `LoadCollisionWhenINeedIt(bool)` | Enables or disables on-demand (lazy) streaming of collision data as the player moves. |
+
+## Level management
+
+```cpp
+static void SetCollisionInMemory(eLevelName);
+static eLevelName GetCollisionInMemory();
+static void SortOutCollisionAfterLoad();
+```
+
+`SetCollisionInMemory` records which level's collision data is currently resident. `GetCollisionInMemory` queries that value (stored in the protected `ms_collisionInMemory` field). `SortOutCollisionAfterLoad` re-sorts and patches the streaming state after new `.col` data has been injected.
+
+## Triangle planes
+
+Triangle plane data (`CColTrianglePlane`) is computed on demand and must be freed before a `CColModel` is unloaded. Both overloads accept either a `CColModel*` (high-level) or a raw `CCollisionData*` (low-level).
+
+```cpp
+static void CalculateTrianglePlanes(CColModel* pModel);
+static void RemoveTrianglePlanes(CColModel* pModel);
+static void CalculateTrianglePlanes(CCollisionData* pColData);
+static void RemoveTrianglePlanes(CCollisionData* pColData);
+```
+
+<Note>
+Line-of-sight and vertical-line tests require triangle planes to be present. Always call `CalculateTrianglePlanes` before running those tests and `RemoveTrianglePlanes` afterwards to avoid leaking memory.
+</Note>
+
+## Sphere tests
+
+Each pair has a **Test** variant (boolean only) and a **Process** variant that additionally fills a `CColPoint` and a squared-distance accumulator.
+
+<AccordionGroup>
+  <Accordion title="Sphere vs sphere">
+
+```cpp
+static bool TestSphereSphere(const CColSphere& sphereA, const CColSphere& sphereB);
+
+static bool ProcessSphereSphere(
+    const CColSphere& sphereA, const CColSphere& sphereB,
+    CColPoint& colPoint, f32& fDistanceSqr);
+
+// Overload: supply an explicit centre for sphereA (e.g. after applying a matrix)
+static bool ProcessSphereSphere(
+    const CColSphere& sphereA, const CVector& centreA,
+    const CColSphere& sphereB, CColPoint& colPoint, f32& fDistanceSqr);
+```
+
+  </Accordion>
+  <Accordion title="Sphere vs box">
+
+```cpp
+static bool TestSphereBox(const CSphere& sphere, const CBox& box);
+
+static bool ProcessSphereBox(
+    const CColSphere& sphere, const CColBox& box,
+    CColPoint& colPoint, f32& fDistanceSqr);
+```
+
+`TestSphereBox` uses the base `CSphere`/`CBox` types (no surface metadata). `ProcessSphereBox` operates on the typed collision variants and populates surface/piece/lighting fields in `colPoint`.
+
+  </Accordion>
+  <Accordion title="Sphere vs triangle">
+
+```cpp
+static bool TestSphereTriangle(
+    const CColSphere& sphere, const CollisionVector* aVectors,
+    const CColTriangle& triangle, const CColTrianglePlane& plane);
+
+static bool ProcessSphereTriangle(
+    const CColSphere& sphere, const CollisionVector* aVectors,
+    const CColTriangle& triangle, const CColTrianglePlane& plane,
+    CColPoint& colPoint, f32& fDistanceSqr);
+```
+
+Both functions require a pre-computed `CColTrianglePlane`. The `aVectors` array is the compressed vertex buffer from `CCollisionData::m_pTriCompressedVectorArray`.
+
+  </Accordion>
+</AccordionGroup>
+
+## Line tests
+
+Line tests accept a `CColLine` (start + end point, 32-byte aligned) and test it against various primitive shapes. The **Process** variants output a `CColPoint` and a `fCollisionRatio` in `[0, 1]` representing how far along the segment the hit occurred.
+
+<Tabs>
+  <Tab title="Sphere">
+
+```cpp
+static bool TestLineSphere(const CColLine& line, const CColSphere& sphere);
+
+static bool ProcessLineSphere(
+    const CColLine& line, const CColSphere& sphere,
+    CColPoint& colPoint, f32& fCollisionRatio);
+```
+
+  </Tab>
+  <Tab title="Box">
+
+```cpp
+static bool TestLineBox(const CColLine& line, const CBox& box);
+static bool TestVerticalLineBox(const CColLine& Line, const CBox& box);
+static bool ProcessLineBox(
+    const CColLine& line, const CColBox& box,
+    CColPoint& colPoint, f32& fCollisionRatio);
+
+// Standalone DW variant (no class state required)
+static bool TestLineBox_DW(const CColLine& line, const CBox& box);
+```
+
+`TestVerticalLineBox` is an optimised path for strictly vertical rays (X and Y components zero). `TestLineBox_DW` is a self-contained implementation that does not rely on `CCollision` instance state and can be called from worker threads.
+
+  </Tab>
+  <Tab title="Triangle">
+
+```cpp
+static bool TestLineTriangle(
+    const CColLine& line, const CollisionVector* aVectors,
+    const CColTriangle& triangle, const CColTrianglePlane& plane);
+
+static bool ProcessLineTriangle(
+    const CColLine& line, const CollisionVector* aVectors,
+    const CColTriangle& triangle, const CColTrianglePlane& plane,
+    CColPoint& colPoint, f32& fCollisionRatio,
+    CStoredCollPoly* pStoredPoly);
+
+static bool ProcessVerticalLineTriangle(
+    const CColLine& line, const CollisionVector* aVectors,
+    const CColTriangle& triangle, const CColTrianglePlane& plane,
+    CColPoint& colPoint, f32& fCollisionRatio,
+    CStoredCollPoly* pStoredPoly);
+```
+
+`ProcessLineTriangle` works for arbitrary ray directions. `ProcessVerticalLineTriangle` assumes a downward-pointing ray and is faster for ground-height queries. Both accept an optional `CStoredCollPoly*` that caches the hit polygon for subsequent frames.
+
+  </Tab>
+  <Tab title="2D line vs line">
+
+```cpp
+static bool Test2DLineAgainst2DLine(
+    f32 Start1X, f32 Start1Y, f32 Delta1X, f32 Delta1Y,
+    f32 Start2X, f32 Start2Y, f32 Delta2X, f32 Delta2Y);
+```
+
+Tests whether two 2D line segments (expressed as start + delta) intersect. Used for flat-plane checks such as road boundary detection.
+
+  </Tab>
+</Tabs>
+
+## Distance utilities
+
+These helpers compute geometric distances and projections used internally by the sphere and line processors, but they are also accessible to game code.
+
+### DistToLine and DistToLineSqr
+
+```cpp
+static f32 DistToLine(
+    const CVector* pVecStart, const CVector* pVecEnd, const CVector* pPoint);
+
+static f32 DistToLineSqr(
+    const CVector* pVecStart, const CVector* pVecEnd, const CVector* pPoint);
+```
+
+Return the distance (or its square) from `pPoint` to the finite line segment `[pVecStart, pVecEnd]`. If the nearest point on the segment is one of the endpoints, the distance to that endpoint is returned.
+
+### DistToMathematicalLine (3D)
+
+```cpp
+static f32 DistToMathematicalLine(
+    const CVector* pVecStart, const CVector* pVecEnd, const CVector* pPoint);
+```
+
+Computes the perpendicular distance from `pPoint` to the **infinite** mathematical line through `pVecStart` and `pVecEnd` using the cross-product formula:
+
+```
+dir   = pVecEnd - pVecStart
+delta = pPoint  - pVecStart
+cross = delta × dir
+distance = |cross| / |dir|
+```
+
+Returns `0.0` when the point lies exactly on the line. The direction vector need not be normalised.
+
+### DistToMathematicalLine2D
+
+```cpp
+static f32 DistToMathematicalLine2D(
+    f32 LineStartX, f32 LineStartY,
+    f32 LineDirX,   f32 LineDirY,
+    f32 PointX,     f32 PointY);
+```
+
+2D analogue using the projection formula:
+
+```
+delta      = (PointX - LineStartX, PointY - LineStartY)
+projection = dot(delta, dir) / dot(dir, dir)
+perp       = delta - projection * dir
+distance   = |perp|
+```
+
+### DistAlongLine2D
+
+```cpp
+static f32 DistAlongLine2D(
+    f32 LineStartX, f32 LineStartY,
+    f32 LineDirX,   f32 LineDirY,
+    f32 PointX,     f32 PointY);
+```
+
+Returns the signed scalar projection of the point onto the line direction — how far along the line the closest point lies, in the same units as the direction vector's length.
+
+### Closest-point utilities
+
+```cpp
+static void ClosestPointOnLine(
+    CVector* pP, CVector* pS, CVector* pE, CVector* pClosest);
+
+static void ClosestPointsOnPoly(
+    CColTriangle* pP, CVector* pV, CVector* pClosest, CVector* pVec);
+
+static void Closest3(CVector* pP, CVector* pClosest);
+
+static void ClosestPointOnPoly(
+    CColTriangle* pP, CVector* pVerts, CVector* pClosest);
+```
+
+| Function | Description |
+|----------|-------------|
+| `ClosestPointOnLine` | Clamps `pP` onto segment `[pS, pE]` and writes the result to `pClosest`. |
+| `ClosestPointsOnPoly` | Finds the closest point on a triangle `pP` (with vertices `pV`) to an external point, writing to `pClosest` and `pVec`. |
+| `Closest3` | Reduces a set of three candidate points in `pP` to the nearest one and stores it in `pClosest`. |
+| `ClosestPointOnPoly` | Simplified variant: finds the closest point on triangle `pP` to `pClosest` using the vertex array `pVerts`. |
+
+## Model vs model
+
+```cpp
+static i32 ProcessColModels(
+    const CMatrix& matA, CColModel& colModelA,
+    const CMatrix& matB, CColModel& colModelB,
+    CColPoint* aColPoints,
+    CColPoint* aLineColPoints  = nullptr,
+    f32*       aLineRatios     = nullptr,
+    bool       bReturnAllCollisions = false);
+```
+
+The primary broad-to-narrow pipeline. It transforms `colModelA` into `colModelB`'s local space, runs broad-phase bounding-sphere and bounding-box rejection, then tests every primitive pair. Returns the number of collision points written into `aColPoints`. Passing `bReturnAllCollisions = true` continues testing after the first hit rather than returning early.
+
+<Warning>
+`aColPoints` must be large enough to hold all possible results. The engine typically allocates 16 or 32 entries. Overflowing the buffer produces undefined behaviour.
+</Warning>
+
+## Point-in-polygon helpers
+
+```cpp
+bool PointInTriangle(const CVector& testPoint, const CVector* triPts);
+
+static bool PointInPoly(
+    CVector* pP, CColTriangle* pPoly, CVector* pNormal, CVector* pV);
+```
+
+`PointInTriangle` is a non-static member (called on a `CCollision` object, though it carries no instance state). `PointInPoly` is the static variant that also accepts a pre-computed normal and a vertex array.
+
+## Miscellaneous
+
+```cpp
+static i32  GetPrincipleAxis(CVector* pNormal);
+static i32  RayPolyPOP(CVector* pRS, CVector* pRD, CColTriangle* pP, CVector* pNormal, CVector* pVert);
+static bool IsThisVehicleSittingOnMe(CVehicle* pVehicleMe, CVehicle* pVehicleTest);
+```
+
+| Function | Description |
+|----------|-------------|
+| `GetPrincipleAxis` | Returns the dominant axis index (`COLTRIANGLE_AXIS_POS/NEG X/Y/Z`) for a normal vector — used for projecting triangle tests into 2D. |
+| `RayPolyPOP` | Ray–polygon intersection test using a plane–object–projection approach. Returns the number of crossings. |
+| `IsThisVehicleSittingOnMe` | Checks whether `pVehicleTest` is resting on top of `pVehicleMe` using the collision record list. |
+
+## Static fields
+
+```cpp
+static bool bCamCollideWithVehicles;
+static bool bCamCollideWithObjects;
+static bool bCamCollideWithBuildings;
+static bool bCamCollideWithPeds;
+static f32  relVelCamCollisionVehiclesSqr;
+static u32  ms_iProcessLineNumCrossings;
+```
+
+The four `bCamCollide*` flags gate which entity categories the camera sweep-sphere tests against (see [Camera collision](/detection/camera-collision)). `relVelCamCollisionVehiclesSqr` is a squared relative-velocity threshold below which vehicle–camera collisions are ignored. `ms_iProcessLineNumCrossings` counts ray crossings accumulated during the current `ProcessLineOfSight` call and is reset each frame.
+
+## CColCacheEntry
+
+`CColCacheEntry` is a lightweight tagged union used to build the camera-collision cache. Each entry records one primitive — either a new entity reference or a specific triangle, sphere, or box index within the previous entity.
+
+```cpp
+enum
+{
+    COL_CACHE_TYPE_NEWENT,   // 0 — start of a new entity's data
+    COL_CACHE_TYPE_TRI,      // 1 — triangle index
+    COL_CACHE_TYPE_SPHERE,   // 2 — sphere index
+    COL_CACHE_TYPE_BOX       // 3 — box index
+};
+
+class CColCacheEntry
+{
+public:
+    u8      type;   // one of COL_CACHE_TYPE_*
+    CEntity* pEnt;  // valid when type == COL_CACHE_TYPE_NEWENT
+    u16     triId;  // valid when type == COL_CACHE_TYPE_TRI
+    u16     sphId;  // valid when type == COL_CACHE_TYPE_SPHERE
+    u16     boxId;  // valid when type == COL_CACHE_TYPE_BOX
+
+    bool AddNewEnt(CEntity* pEntity);  // sa 0x411CA0
+    bool AddNewTri(i32 id);            // sa 0x411CB0
+    bool AddNewSph(i32 id);            // sa 0x411CD0
+    bool AddNewBox(i32 id);            // sa 0x411CF0
+};
+```
+
+Entries are written in order: a `NEWENT` entry marks the start of each entity's block, followed by any number of `TRI`, `SPHERE`, or `BOX` entries. The camera sweep code reads these back to avoid re-querying the world each frame.

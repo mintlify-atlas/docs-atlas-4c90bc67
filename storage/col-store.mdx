@@ -1,0 +1,255 @@
+---
+title: "CColStore: streaming and reference-counting .col files"
+description: "CColStore manages named .col file slots in a CPool backed by a CQuadTreeNode, loading and evicting collision geometry as the player moves through the world."
+---
+
+`CColStore` is the central authority for loading, unloading, and reference-counting named collision files in GTA:SA. Each `.col` file occupies a numbered slot in a `CPool`, and a `CQuadTreeNode` spatial index determines which slots are relevant for a given world position. The class is entirely static — all state lives in three private fields shared across the engine.
+
+## ColDef struct
+
+Every slot is described by a `ColDef` record. This is the data the pool allocates per loaded collision file.
+
+```cpp
+struct ColDef
+{
+    CRect bb;             // World-space bounding rectangle of the file's coverage area
+    char  name[18];       // Filename identifier (no extension)
+    i16   firstModel;     // First model index whose collision is in this file
+    i16   lastModel;      // Last model index whose collision is in this file
+    i16   refCount;       // Number of active references keeping the file loaded
+    bool  loaded;         // True when collision geometry is resident in memory
+    bool  required;       // True when the engine has decided this slot must be loaded
+    bool  inMemoryAlways; // True for slots that must never be evicted
+    bool  interior;       // True for interior-space collision files
+};
+CHECK_SIZE_X86(ColDef, 0x2C);
+```
+
+<Note>
+`firstModel` and `lastModel` form an inclusive range. Any model whose index falls within `[firstModel, lastModel]` has its collision geometry stored in this file.
+</Note>
+
+## Private fields
+
+| Field | Type | Purpose |
+|---|---|---|
+| `ms_pColPool` | `CPool<ColDef>*` | Fixed-size pool of `ColDef` slots |
+| `ms_pQuadTree` | `CQuadTreeNode*` | Spatial index mapping world rectangles to slot indices |
+| `m_onlyBB` | `bool` | When true, only bounding boxes are loaded — geometry is deferred |
+
+## Lifecycle
+
+### Initialise and Shutdown
+
+```cpp
+static void Initialise();
+static void Shutdown();
+```
+
+`Initialise()` allocates the pool and constructs the quad-tree over the world bounds. `Shutdown()` frees all geometry, destroys the quad-tree, and deallocates the pool. Call order mirrors the game's subsystem init/deinit sequence.
+
+### Pool size
+
+```cpp
+static i32 GetSize();
+```
+
+Returns the capacity of the underlying pool — not the number of occupied slots.
+
+## Slot management
+
+### AddColSlot
+
+```cpp
+static i32 AddColSlot(const char* pName);
+```
+
+Allocates a new `ColDef` in the pool, copies `pName` into `ColDef::name`, and inserts the slot's bounding rectangle into the quad-tree. Returns the integer slot index that all other methods use to identify this file.
+
+### RemoveColSlot
+
+```cpp
+static void RemoveColSlot(i32 index);
+```
+
+Removes the slot from the quad-tree and frees its `ColDef`. Any geometry that was loaded is not automatically unloaded — call `RemoveCol` first.
+
+### IsValidSlot
+
+```cpp
+static bool IsValidSlot(i32 index)
+{
+    CN_ASSERT(index >= 0);
+    CN_ASSERT(ms_pColPool != nullptr);
+    CN_ASSERT(index < ms_pColPool->GetSize());
+
+    return ms_pColPool->GetSlot(index) != nullptr;
+}
+```
+
+Returns `true` only when the pool slot at `index` is occupied. The three assertions guard against out-of-bounds and uninitialized-pool bugs in debug builds.
+
+### GetColName / FindColSlot
+
+```cpp
+static const char* GetColName(i32 index);
+static i32 FindColSlot(const char* pName);
+```
+
+`GetColName` returns a pointer to `ColDef::name` for the given index. `FindColSlot` performs a linear scan of the pool and returns the first slot whose name matches `pName`, or `-1` if none is found.
+
+## Reference counting
+
+```cpp
+static void AddRef(i32 index);
+static void RemoveRef(i32 index);
+```
+
+`AddRef` increments `ColDef::refCount`. `RemoveRef` decrements it, and when the count reaches zero the slot is eligible for eviction by the streaming system. The game calls `AddRef` when an entity that depends on this file is created, and `RemoveRef` when it is destroyed.
+
+## Loading and unloading geometry
+
+### LoadCol (from file)
+
+```cpp
+static void LoadCol(i32 index, const char* pFilename);
+```
+
+Opens `pFilename`, reads the `.col` block sequence, and registers each collision model with the appropriate model index. Sets `ColDef::loaded` to `true` on success.
+
+### LoadCol (from buffer)
+
+```cpp
+static bool LoadCol(i32 index, u8* pBuffer, i32 size);
+```
+
+Parses a pre-read memory buffer instead of reading from disk. Returns `true` on success. Used by the streaming system when the IMG archive has already been decompressed into a scratch buffer.
+
+### RemoveCol
+
+```cpp
+static void RemoveCol(i32 index);
+```
+
+Frees all collision geometry registered under this slot and clears `ColDef::loaded`. The slot itself remains in the pool and can be re-loaded later.
+
+## Model index helpers
+
+```cpp
+static void IncludeModelIndex(i32 index, i32 modelIndex);
+```
+
+Expands the `[firstModel, lastModel]` range of the slot to include `modelIndex` if it falls outside the current bounds.
+
+```cpp
+// Inline implementations from col_store.hpp
+inline i32 CColStore::GetFirstModel(i32 index)
+{
+    ColDef* pColDef = ms_pColPool->GetSlot(index);
+    return pColDef->firstModel;
+}
+
+inline i32 CColStore::GetLastModel(i32 index)
+{
+    ColDef* pColDef = ms_pColPool->GetSlot(index);
+    return pColDef->lastModel;
+}
+```
+
+Both accessors are inlined — they go directly through the pool pointer with no bounds checking in release builds.
+
+## Bounding box access
+
+```cpp
+static CRect& GetBoundingBox(i32 index);
+```
+
+Returns a reference to `ColDef::bb`. The quad-tree uses this rectangle to answer spatial queries.
+
+## Streaming and spatial queries
+
+These methods implement the real-time streaming logic that loads and unloads collision as the player moves.
+
+### SetCollisionRequired
+
+```cpp
+static void SetCollisionRequired(const CVector& posn, i32 areaCode);
+```
+
+Walks the quad-tree to find all slots whose bounding boxes contain `posn` and sets their `required` flag. The `areaCode` parameter restricts the search to interior or exterior slots.
+
+### LoadCollision
+
+```cpp
+static void LoadCollision(CVector posn, bool bLoadScene);
+```
+
+Calls `SetCollisionRequired` and then loads any slot that is required but not yet loaded. When `bLoadScene` is `false`, only geometry within streaming distance is scheduled; when `true`, all required slots are loaded synchronously.
+
+### EnsureCollisionIsInMemory
+
+```cpp
+static void EnsureCollisionIsInMemory(const CVector& posn);
+```
+
+A blocking variant of `LoadCollision` that stalls until all collision within range of `posn` is resident. Used during mission start and cutscene setup.
+
+### AddCollisionNeededAtPosn
+
+```cpp
+static void AddCollisionNeededAtPosn(const CVector& posn);
+```
+
+Adds `posn` to the set of positions that the streaming system must keep collision loaded for. Useful for scripted events that place the camera away from the player.
+
+### RequestCollision / HasCollisionLoaded
+
+```cpp
+static void RequestCollision(const CVector& posn, i32 areaCode);
+static bool HasCollisionLoaded(const CVector& posn, i32 areaCode);
+```
+
+`RequestCollision` marks relevant slots as requested in the streaming queue. `HasCollisionLoaded` returns `true` only when every slot covering `posn` in `areaCode` has `loaded == true`. Together they form a non-blocking load/poll pattern.
+
+## Bulk operations
+
+```cpp
+static void LoadAllBoundingBoxes();
+static void BoundingBoxesPostProcess();
+static void RemoveAllCollision();
+static void LoadAllCollision();
+```
+
+`LoadAllBoundingBoxes` reads only the `ColTag` headers from every known `.col` file to populate `ColDef::bb` without loading geometry. `BoundingBoxesPostProcess` inserts those rectangles into the quad-tree. `RemoveAllCollision` unloads all geometry but preserves slots. `LoadAllCollision` synchronously loads every slot — used in tool and editor builds.
+
+## Debug accessor
+
+```cpp
+#ifdef CN_DEBUG
+static CPool<ColDef>* GetColPool() { return ms_pColPool; }
+#endif
+```
+
+Exposes the raw pool pointer in debug builds for inspection tools and test harnesses. Not available in release.
+
+## Streaming workflow
+
+The following diagram shows the full lifetime of a collision slot from registration to eviction.
+
+<Steps>
+  <Step title="Register the slot">
+    Call `AddColSlot(name)` at world-load time. The slot is inserted into the quad-tree with an empty bounding rectangle; `loaded` is `false`.
+  </Step>
+  <Step title="Load bounding boxes">
+    `LoadAllBoundingBoxes()` reads every `.col` header and fills `ColDef::bb`. `BoundingBoxesPostProcess()` updates the quad-tree so spatial queries work correctly.
+  </Step>
+  <Step title="Stream in geometry">
+    As the player moves, `LoadCollision(posn, false)` marks nearby slots as required and loads their geometry. `ColDef::loaded` becomes `true` and `refCount` is incremented by each entity that depends on the file.
+  </Step>
+  <Step title="Hold with references">
+    Each `AddRef` call prevents eviction. The streaming system will not unload a slot while `refCount > 0`.
+  </Step>
+  <Step title="Evict when idle">
+    When the player moves away, `RemoveRef` is called for each departing entity. Once `refCount` reaches zero and the slot is no longer `required`, `RemoveCol` frees the geometry.
+  </Step>
+</Steps>

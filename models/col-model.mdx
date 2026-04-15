@@ -1,0 +1,200 @@
+---
+title: "CColModel: collision volume container for one model"
+description: "CColModel inherits CBoundingBox and owns CCollisionData. It manages single vs multiple allocation, streaming level, and triangle-plane lifecycle."
+---
+
+`CColModel` is the top-level object attached to every collidable entity in GTA:SA. It extends `CBoundingBox` to supply both a bounding sphere and a bounding box for broad-phase culling, then points to a `CCollisionData` instance that stores the actual collision primitives. All `new`/`delete` operations route through the engine's pool allocator, keeping allocation within a fixed-size pool.
+
+## Class overview
+
+```cpp
+class CColModel : public CBoundingBox
+{
+public:
+    CColModel();
+    ~CColModel();
+
+    void* operator new(usize nSize) CN_NOEXCEPT;
+    void operator delete(void* pVoid) CN_NOEXCEPT;
+
+    CColModel& operator=(const CColModel& cCol);
+
+    // Allocation
+    void AllocateData();
+    void AllocateData(i32 numSpheres, i32 numBoxes, i32 numLines,
+                      i32 numVertices, i32 numTriangles,
+                      bool bUseDisksNotLines = false);
+    void AllocateData(i32 size);
+    void RemoveCollisionVolumes();
+
+    // Data access
+    CCollisionData*       GetCollisionData()       { return m_pColData; }
+    const CCollisionData* GetCollisionData() const { return m_pColData; }
+
+    // Triangle planes
+    void CalculateTrianglePlanes();
+    void RemoveTrianglePlanes();
+
+    // Level
+    void SetLevel(u8 level) { m_level = level; }
+    u8   GetLevel()         { return m_level; }
+
+    // Allocation strategy
+    void MakeMultipleAlloc();
+
+    // Fields
+    u8 m_level;
+    u8 m_hasCollisionVolumes : 1;
+    u8 m_useSingleAlloc      : 1;
+    u8 m_deleteUncompressed  : 1;
+
+    CCollisionData* m_pColData;
+};
+CHECK_SIZE_X86(CColModel, 0x30);
+```
+
+## Fields
+
+<ResponseField name="m_level" type="u8">
+  Streaming level the model belongs to. Set via `SetLevel()` and read via `GetLevel()`. The engine uses this to decide which collision data to load or unload when the player moves between areas.
+</ResponseField>
+
+<ResponseField name="m_hasCollisionVolumes" type="u8 : 1">
+  Flag indicating that the `CCollisionData` payload currently contains at least one primitive. The engine checks this before attempting narrow-phase tests.
+</ResponseField>
+
+<ResponseField name="m_useSingleAlloc" type="u8 : 1">
+  When set, the entire `CCollisionData` header and all its primitive arrays live in a single contiguous heap block. Freeing the model only requires one `CMemoryMgr::Free` call. Cleared when `MakeMultipleAlloc()` splits the data back into separate allocations.
+</ResponseField>
+
+<ResponseField name="m_deleteUncompressed" type="u8 : 1">
+  When set (the default), the destructor frees `m_pColData`. Clear this flag before transferring ownership of the data to another owner to prevent a double-free.
+</ResponseField>
+
+<ResponseField name="m_pColData" type="CCollisionData*">
+  Pointer to the collision data payload. `nullptr` when no volumes have been allocated. Use `GetCollisionData()` for read access.
+</ResponseField>
+
+## AllocateData overloads
+
+### Default overload
+
+```cpp
+void CColModel::AllocateData()
+```
+
+Heap-allocates a fresh, empty `CCollisionData` with `new` (separate allocations). Sets `m_useSingleAlloc = false`. Use this when you will populate the data yourself by assigning sphere, box, and triangle arrays after the call.
+
+### Structured overload
+
+```cpp
+void CColModel::AllocateData(
+    i32 numSpheres, i32 numBoxes, i32 numLines,
+    i32 numVertices, i32 numTriangles,
+    bool bUseDisksNotLines = false);
+```
+
+Performs a single contiguous allocation (`m_useSingleAlloc = true`) that fits the `CCollisionData` header at offset `0x20` followed by the primitive arrays in this order:
+
+1. `numSpheres × sizeof(CColSphere)` — sphere array
+2. `numLines × sizeof(CColLine)` or `× sizeof(CColDisk)` — line / disk array
+3. `numBoxes × sizeof(CColBox)` — box array
+4. `numTriangles × sizeof(CColTriangle)` — triangle array (4-byte aligned tail)
+5. `numVertices × sizeof(CollisionVector)` — compressed vertex array
+
+Pass `bUseDisksNotLines = true` for WDMOBILE targets that use disk primitives instead of line segments.
+
+### Raw-size overload
+
+```cpp
+void CColModel::AllocateData(i32 size);
+```
+
+Allocates exactly `size` bytes with `CMemoryMgr::Malloc` and points `m_pColData` at the result. Sets `m_useSingleAlloc = true`. The caller is responsible for constructing the `CCollisionData` layout inside the block manually. This is used when the total size is already known from a binary file header.
+
+## RemoveCollisionVolumes
+
+```cpp
+void CColModel::RemoveCollisionVolumes();
+```
+
+Releases `m_pColData` and sets the pointer to `nullptr`. The release strategy depends on `m_useSingleAlloc`:
+
+- `true` — calls `CCollision::RemoveTrianglePlanes`, then `CMemoryMgr::Free(m_pColData)` in one call.
+- `false` — calls `m_pColData->RemoveCollisionVolumes()` to free each sub-array, then `delete m_pColData`.
+
+The destructor follows the same logic when `m_deleteUncompressed` is set.
+
+## Triangle plane management
+
+```cpp
+void CColModel::CalculateTrianglePlanes();
+void CColModel::RemoveTrianglePlanes();
+```
+
+These are thin wrappers that forward to `m_pColData->CalculateTrianglePlanes()` and `m_pColData->RemoveTrianglePlanes()` respectively, guarded by a `nullptr` check on `m_pColData`. Triangle planes are computed on demand for narrow-phase mesh tests and freed when no longer needed to reduce memory pressure.
+
+## MakeMultipleAlloc
+
+```cpp
+void CColModel::MakeMultipleAlloc();
+```
+
+Converts a single-allocation model into a multiple-allocation model. It constructs a new `CCollisionData`, deep-copies the existing data into it via `CCollisionData::Copy`, frees the old contiguous block, and clears `m_useSingleAlloc`. Call this before modifying individual primitive arrays in a model that was loaded from a binary stream.
+
+## Level management
+
+```cpp
+void CColModel::SetLevel(u8 level);
+u8   CColModel::GetLevel();
+```
+
+The level value controls which streaming slot the collision data belongs to. Level `0` is the default for static world geometry. Higher levels correspond to interior or distance-culled zones. The streaming system uses this when deciding what to page in or out.
+
+## Memory pool
+
+`CColModel::operator new` and `operator delete` route through `CColModelPool` (accessed via `CPools::GetColModelPool()`). The pool provides fixed-size storage; the `new` operator asserts that `nSize` fits within the pool entry size and that free spaces are available before returning a slot.
+
+## Example: allocating a simple collision model
+
+```cpp
+// Allocate a model with one sphere, one box, and no triangles.
+CColModel* pModel = new CColModel();
+pModel->AllocateData(
+    /*numSpheres*/   1,
+    /*numBoxes*/     1,
+    /*numLines*/     0,
+    /*numVertices*/  0,
+    /*numTriangles*/ 0);
+
+CCollisionData* pData = pModel->GetCollisionData();
+
+// Set the sphere primitive.
+pData->m_pSphereArray[0].Set(
+    1.5f,                     // radius
+    CVector(0.0f, 0.0f, 0.0f),
+    SURFACE_DEFAULT,
+    PIECE_DEFAULT);
+
+// Set the box primitive.
+pData->m_pBoxArray[0].Set(
+    CVector(-1.0f, -1.0f, -0.5f),
+    CVector( 1.0f,  1.0f,  0.5f),
+    SURFACE_DEFAULT,
+    PIECE_DEFAULT,
+    0xFF);
+
+// Set broad-phase bounds.
+pModel->SetBoundRadius(2.0f);
+pModel->SetBoundOffset(CVector(0.0f, 0.0f, 0.0f));
+pModel->SetBoundBoxMin(CVector(-1.0f, -1.0f, -0.5f));
+pModel->SetBoundBoxMax(CVector( 1.0f,  1.0f,  0.5f));
+
+// ... use pModel ...
+
+delete pModel; // returns slot to pool, frees CCollisionData
+```
+
+<Warning>
+  Never hold a raw pointer to a `CTempColModels` entry (such as `ms_colModelPed1`) across frames. Those models are shared and re-used. Allocate your own `CColModel` when you need stable, long-lived collision data.
+</Warning>

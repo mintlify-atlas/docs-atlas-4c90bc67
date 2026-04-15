@@ -1,0 +1,171 @@
+---
+title: "Line-of-sight, vertical line, and pill collision tests"
+description: "How CCollision's TestLineOfSight, ProcessVerticalLine, and pill functions work, covering CStoredCollPoly frame caching and see-through surface flags."
+---
+
+The line-of-sight subsystem casts a ray or swept capsule through a single `CColModel` transformed by a matrix and reports the earliest intersection point. It is built on top of the same `ProcessLineTriangle` / `ProcessLineSphere` / `ProcessLineBox` primitives used by the general collision system, but adds two extra filtering flags that let certain surfaces be transparent to sight or to bullets.
+
+## See-through and shoot-through flags
+
+Every line-of-sight and vertical-line function accepts two boolean flags:
+
+| Flag | Meaning |
+|------|---------|
+| `bSeeThroughStuff` | When `true`, surfaces tagged as visually transparent (e.g. glass, foliage) are skipped. |
+| `bShootThroughStuff` | When `true`, surfaces tagged as permeable to bullets (e.g. thin fences, vegetation) are skipped. |
+
+Setting both flags to `false` produces a fully opaque ray that stops at any surface. Setting them selectively allows the engine to query whether a target is visible to an AI, or whether a bullet will pass through an obstacle, without running two separate queries.
+
+## TestLineOfSight
+
+```cpp
+static bool TestLineOfSight(
+    const CColLine& line,
+    const CMatrix&  mat,
+    CColModel&      colModel,
+    bool            bSeeThroughStuff,
+    bool            bShootThroughStuff);
+```
+
+Fast rejection test — returns `true` if `line` (in world space, transformed by `mat`) intersects any opaque primitive in `colModel`. No contact details are produced. Use this to perform a quick yes/no visibility check before committing to the more expensive `ProcessLineOfSight`.
+
+## ProcessLineOfSight
+
+```cpp
+static bool ProcessLineOfSight(
+    const CColLine& line,
+    const CMatrix&  mat,
+    CColModel&      colModel,
+    CColPoint&      colPoint,
+    f32&            fCollisionRatio,
+    bool            bSeeThroughStuff,
+    bool            bShootThroughStuff);
+```
+
+Full test that, on a hit, writes the contact position, surface normal, and material metadata into `colPoint` and sets `fCollisionRatio` to a value in `[0, 1]` representing how far along the segment the first intersection lies. If multiple primitives are hit, only the nearest (smallest ratio) is reported.
+
+## ProcessVerticalLine
+
+```cpp
+static bool ProcessVerticalLine(
+    const CColLine&   Line,
+    const CMatrix&    mat,
+    CColModel&        colModel,
+    CColPoint&        colPoint,
+    f32&              fCollisionRatio,
+    bool              bSeeThroughStuff,
+    bool              bShootThroughStuff,
+    CStoredCollPoly*  pStoredPoly);
+```
+
+An optimised variant for strictly vertical rays (downward Z). Because the ray direction is fixed, the per-primitive tests are simplified using `ProcessVerticalLineTriangle` and `TestVerticalLineBox`. Pass a `CStoredCollPoly*` to enable per-frame caching of the last-hit polygon — the engine uses this to avoid re-testing the same triangle when the camera or entity has barely moved.
+
+<Note>
+`ProcessVerticalLine` requires triangle planes to have been pre-computed with `CCollision::CalculateTrianglePlanes`. Call `RemoveTrianglePlanes` when finished to free the plane array.
+</Note>
+
+## TestPillWithSpheresInColModel
+
+```cpp
+static bool TestPillWithSpheresInColModel(
+    const CColLine& line,
+    f32             radius,
+    const CMatrix&  mat,
+    CColModel&      colModel);
+```
+
+Tests a swept capsule (a line segment with a spherical cross-section of `radius`) against all sphere primitives in `colModel`. This is used for approximate proximity checks, such as determining whether a character's body capsule is near a collidable surface, without paying the cost of a full mesh test.
+
+## TestLineWithSpecificTris
+
+```cpp
+static bool TestLineWithSpecificTris(
+    const CColLine& line,
+    const CMatrix&  mat,
+    CColModel&      colModel,
+    u8              flags);
+```
+
+Tests `line` against only those triangles in `colModel` whose surface-type flags match `flags`. Allows selective ray queries — for example, testing only water-surface triangles for ripple generation, or only solid-road triangles for tyre contact.
+
+## IsStoredPolyStillValidVerticalLine
+
+```cpp
+static bool IsStoredPolyStillValidVerticalLine(
+    const CVector&   vecStart,
+    f32              zEnd,
+    CColPoint&       colPoint,
+    CStoredCollPoly* pStoredPoly);
+```
+
+Validates a cached `CStoredCollPoly` without re-running the full vertical-line test. It checks that `vecStart` (XY position) still falls inside the three vertices of the stored polygon, and that `zEnd` is below the stored hit height. If the stored poly is still valid, `colPoint` is updated in place and the function returns `true`, saving a full `ProcessVerticalLine` call.
+
+## CStoredCollPoly
+
+`CStoredCollPoly` caches the geometry of the most recently hit triangle for reuse in subsequent frames. It is declared as a plain `struct` with no methods and occupies exactly **0x2C bytes** on x86.
+
+```cpp
+struct CStoredCollPoly
+{
+    CVector V1;                // first  vertex of the hit triangle (world space)
+    CVector V2;                // second vertex of the hit triangle (world space)
+    CVector V3;                // third  vertex of the hit triangle (world space)
+    bool    bValidPolyStored;  // true when V1/V2/V3 hold a live result
+    u32     lighting;          // packed lighting value from the triangle
+};
+CHECK_SIZE_X86(CStoredCollPoly, 0x2C);
+```
+
+Set `bValidPolyStored = false` to invalidate the cache, for example when the entity's collision model changes or the entity teleports.
+
+## Usage example: ground-height raycast
+
+The following pattern is the standard way to find the ground height beneath a world position using vertical line casting.
+
+```cpp
+CColLine    ray(position, CVector(position.x, position.y, position.z - 40.0f));
+CColPoint   contact;
+f32         ratio = 1.0f;
+CStoredCollPoly storedPoly;
+storedPoly.bValidPolyStored = false;
+
+// Try the cheap cached path first.
+if (storedPoly.bValidPolyStored &&
+    CCollision::IsStoredPolyStillValidVerticalLine(
+        position, ray.m_vecEnd.z, contact, &storedPoly))
+{
+    f32 groundZ = contact.GetPosition().z;
+}
+else
+{
+    CCollision::CalculateTrianglePlanes(colModel);
+
+    if (CCollision::ProcessVerticalLine(
+            ray, entityMatrix, *colModel,
+            contact, ratio,
+            /*bSeeThroughStuff=*/false,
+            /*bShootThroughStuff=*/false,
+            &storedPoly))
+    {
+        f32 groundZ = contact.GetPosition().z;
+    }
+
+    CCollision::RemoveTrianglePlanes(colModel);
+}
+```
+
+<Warning>
+Always pair `CalculateTrianglePlanes` with `RemoveTrianglePlanes`. Failing to call the removal function leaks the plane array from the heap.
+</Warning>
+
+## Relationship between functions
+
+The table below shows which primitive types each function tests:
+
+| Function | Spheres | Boxes | Triangles |
+|----------|---------|-------|-----------|
+| `TestLineOfSight` | Yes | Yes | Yes |
+| `ProcessLineOfSight` | Yes | Yes | Yes |
+| `ProcessVerticalLine` | No | Yes (vertical) | Yes (vertical) |
+| `TestPillWithSpheresInColModel` | Yes | No | No |
+| `TestLineWithSpecificTris` | No | No | Yes (filtered) |

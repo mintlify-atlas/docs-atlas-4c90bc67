@@ -1,0 +1,104 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "GTA:SA Collision",
+  "projectDescription": "A C++ reverse-engineered implementation of the Grand Theft Auto: San Andreas collision detection system, covering primitives, models, physical simulation, and spatial acceleration structures.",
+  "theme": "aspen",
+  "primaryColor": "#C0392B",
+  "lightColor": "#E74C3C",
+  "darkColor": "#922B21",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": [
+              "introduction",
+              "architecture"
+            ]
+          },
+          {
+            "group": "Collision Primitives",
+            "pages": [
+              "primitives/col-sphere",
+              "primitives/col-box",
+              "primitives/col-line",
+              "primitives/col-triangle",
+              "primitives/col-point"
+            ]
+          },
+          {
+            "group": "Collision Models",
+            "pages": [
+              "models/col-model",
+              "models/collision-data",
+              "models/bounding-box",
+              "models/temp-col-models"
+            ]
+          },
+          {
+            "group": "Detection & Physics",
+            "pages": [
+              "detection/collision-class",
+              "detection/physical",
+              "detection/line-of-sight",
+              "detection/camera-collision"
+            ]
+          },
+          {
+            "group": "Storage & Acceleration",
+            "pages": [
+              "storage/col-store",
+              "storage/col-accel",
+              "storage/col-tag"
+            ]
+          },
+          {
+            "group": "Internals",
+            "pages": [
+              "internals/compressed-float",
+              "internals/col-data",
+              "internals/stored-coll-poly",
+              "internals/collision-plugin"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Sphere, box, line, and triangle collision primitives with surface/piece type metadata",
+    "CColModel and CCollisionData for managing collections of collision volumes",
+    "CCollision static class with extensive test and process methods (sphere-sphere, sphere-box, line-triangle, etc.)",
+    "CPhysical base class providing physics simulation: mass, velocity, friction, elasticity, collision response",
+    "CColStore for streaming collision data files in and out of memory using a quad-tree spatial index",
+    "CColAccel caching system for fast collision loading and IPL entity acceleration",
+    "Compressed float and vector types for memory-efficient storage of normals and triangle planes",
+    "CTempColModels providing pre-allocated shared collision models for peds, vehicles, and props",
+    "Camera collision subsystem with sphere-cast and cone-cast utilities",
+    "Multi-platform support including WDMOBILE-specific collision model sections"
+  ],
+  "publicApiSurface": [
+    "CCollision::TestSphereSphere / ProcessSphereSphere",
+    "CCollision::TestSphereBox / ProcessSphereBox",
+    "CCollision::TestSphereTriangle / ProcessSphereTriangle",
+    "CCollision::TestLineSphere / ProcessLineSphere",
+    "CCollision::TestLineBox / ProcessLineBox",
+    "CCollision::TestLineTriangle / ProcessLineTriangle",
+    "CCollision::ProcessLineOfSight",
+    "CCollision::ProcessVerticalLine",
+    "CCollision::ProcessColModels",
+    "CCollision::CalculateTrianglePlanes / RemoveTrianglePlanes",
+    "CColModel::AllocateData / RemoveCollisionVolumes",
+    "CColStore::AddColSlot / LoadCol / RemoveCol / RequestCollision",
+    "CColAccel::startCache / endCache / cacheLoadCol / addCacheCol",
+    "CPhysical::ApplyMoveForce / ApplyTurnForce / ApplyForce",
+    "CPhysical::CheckCollision / ApplyCollision / ApplySoftCollision",
+    "CPhysical::ApplySpringCollision / ApplySpringDampening",
+    "CTempColModels::Initialise / Shutdown",
+    "CCollisionPlugin::PluginAttach / SetModelInfo",
+    "CompressNormalFloat / DecompressNormalFloat",
+    "CColSphere::IntersectRay / IntersectEdge / IntersectSphere"
+  ]
+}

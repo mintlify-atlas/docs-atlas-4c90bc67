@@ -1,0 +1,77 @@
+---
+title: "CCollisionPlugin: attaching collision to RenderWare"
+description: "Static class that registers the collision plugin with the RenderWare clump system and binds collision data to individual 3D model instances at load time."
+---
+
+GTA:SA renders the world using RenderWare, which organises 3D models as *clumps* — hierarchical objects composed of frames and atomics. The engine extends clumps with a plugin mechanism: extra data blocks can be attached to any clump at runtime without modifying the RenderWare runtime itself. `CCollisionPlugin` owns the registration and binding of collision data through this mechanism.
+
+## Class definition
+
+```cpp
+class CCollisionPlugin
+{
+public:
+    static bool PluginAttach();
+    static void SetModelInfo(CClumpModelInfo* pModelInfo);
+};
+```
+
+Both methods are static — `CCollisionPlugin` is never instantiated. It acts as a namespace for the two operations that connect the collision subsystem to the RenderWare plugin layer.
+
+## `PluginAttach`
+
+```cpp
+static bool PluginAttach();
+```
+
+`PluginAttach` registers the collision plugin with RenderWare's clump plugin system during engine startup. Internally, this calls the RenderWare plugin registration API, which allocates an offset inside every future clump object where collision-related data can be stored. The method returns `true` on success and `false` if registration fails (for example, if the engine is already past the plugin registration window).
+
+This method is called once, early in the startup sequence, before any `.col` files are loaded or any models are streamed in. After `PluginAttach` returns, every clump created or loaded by the engine has a reserved plugin slot for collision data.
+
+<Warning>
+`PluginAttach` must be called before any RenderWare clumps are created. Calling it after clump creation begins produces undefined plugin offset behaviour and will likely result in a crash when `SetModelInfo` is later called.
+</Warning>
+
+## `SetModelInfo`
+
+```cpp
+static void SetModelInfo(CClumpModelInfo* pModelInfo);
+```
+
+`SetModelInfo` associates collision data with a specific clump model. It is called during the `.col` file loading pipeline, after the raw collision data for a model has been parsed and allocated in memory. The method writes a pointer to the collision model into the plugin slot that `PluginAttach` reserved.
+
+`CClumpModelInfo` is the model info type for all clump-based assets (vehicles, peds, objects). It inherits from the base model info class and carries a pointer to the model's `CColModel`. `SetModelInfo` is the point where that pointer is wired up via the plugin slot rather than a direct field assignment.
+
+<Info>
+`CClumpModelInfo` is defined in `game/model_info/clump_model_info.hpp`. The dependency on this type means `CCollisionPlugin` sits at the boundary between the collision subsystem and the model info subsystem.
+</Info>
+
+## Startup sequence
+
+<Steps>
+  <Step title="Engine initialises RenderWare">
+    The RenderWare runtime starts up and opens the plugin registration window.
+  </Step>
+  <Step title="CCollisionPlugin::PluginAttach() is called">
+    The collision plugin is registered. RenderWare allocates a fixed-size slot in every subsequent clump object. The registration window then closes — no further plugins can be added after this point.
+  </Step>
+  <Step title="Models are streamed in">
+    As the player loads into the world, the streaming system reads `.col` files and constructs `CColModel` objects for each asset.
+  </Step>
+  <Step title="CCollisionPlugin::SetModelInfo() is called per model">
+    For each loaded model, `SetModelInfo` is called with the model's `CClumpModelInfo` pointer. The collision data pointer is written into the plugin slot, making it accessible to any RenderWare code that queries the clump's plugin data.
+  </Step>
+</Steps>
+
+## Relationship to CClumpModelInfo
+
+```cpp
+#include "game/model_info/clump_model_info.hpp"
+```
+
+`CClumpModelInfo` represents the engine-side metadata for a single clump asset. Its relevant responsibilities include:
+
+- Holding the `CColModel*` for the asset's collision geometry.
+- Being passed to `SetModelInfo` so that the collision pointer can be registered in the RenderWare plugin slot, making it retrievable from the clump's RenderWare object at runtime without a separate lookup.
+
+The design keeps collision data out of the RenderWare clump structure itself (which is read-only from the engine's perspective) while still allowing any system that has access to a RenderWare clump pointer to retrieve the associated collision model through the plugin API.

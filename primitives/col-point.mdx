@@ -1,0 +1,256 @@
+---
+title: 'CColPoint — collision contact point and result data'
+description: 'CColPoint records the output of a collision process call: contact position, surface normal, ColData for both objects, and penetration depth.'
+---
+
+`CColPoint` is not a primitive you define on an object — it is the output record produced when two primitives intersect. Every successful collision query populates a `CColPoint` with the contact position, the outward surface normal, the material data for each side of the contact, and the penetration depth. The `dataA` field describes the primitive on the first object (object A), and `dataB` describes the primitive on the second object (object B).
+
+## eColPieceType
+
+`eColPieceType` identifies which region of a model was involved in a contact. Vehicle values map to physical panels and wheels; ped values map to body hit zones used by the damage and ragdoll systems.
+
+```cpp col_point.hpp
+enum eColPieceType
+{
+    COLPOINT_PIECETYPE_DEFAULT,            //  0 — generic, no specific part
+    COLPOINT_PIECETYPE_BONNET,             //  1
+    COLPOINT_PIECETYPE_TRUNK,              //  2
+    COLPOINT_PIECETYPE_FRONTBUMPER,        //  3
+    COLPOINT_PIECETYPE_REARBUMPER,         //  4
+    COLPOINT_PIECETYPE_FRONTLEFTDOOR,      //  5
+    COLPOINT_PIECETYPE_FRONTRIGHTDOOR,     //  6
+    COLPOINT_PIECETYPE_REARLEFTDOOR,       //  7
+    COLPOINT_PIECETYPE_REARRIGHTDOOR,      //  8
+    COLPOINT_PIECETYPE_FRONTLEFTWING,      //  9
+    COLPOINT_PIECETYPE_FRONTRIGHTWING,     // 10
+    COLPOINT_PIECETYPE_REARLEFTWING,       // 11
+    COLPOINT_PIECETYPE_REARRIGHTWING,      // 12
+    COLPOINT_PIECETYPE_FRONTLEFTWHEEL,     // 13
+    COLPOINT_PIECETYPE_FRONTRIGHTWHEEL,    // 14
+    COLPOINT_PIECETYPE_REARLEFTWHEEL,      // 15
+    COLPOINT_PIECETYPE_REARRIGHTWHEEL,     // 16
+    COLPOINT_PIECETYPE_FRONTBIKEWHEEL,     // 17
+    COLPOINT_PIECETYPE_REARBIKEWHEEL,      // 18
+    COLPOINT_PIECETYPE_WINDSCREEN,         // 19
+    COLPOINT_PIECETYPE_PED_SPHERE_LEG,     // 20 — ped leg collision sphere
+    COLPOINT_PIECETYPE_PED_SPHERE_MID,     // 21 — ped torso collision sphere
+    COLPOINT_PIECETYPE_PED_SPHERE_HEAD,    // 22 — ped head collision sphere
+    COLPOINT_PIECETYPE_PED_ZONE_CHEST,     // 23
+    COLPOINT_PIECETYPE_PED_ZONE_MIDSECTION,// 24
+    COLPOINT_PIECETYPE_PED_ZONE_UPPERARM_L,// 25
+    COLPOINT_PIECETYPE_PED_ZONE_UPPERARM_R,// 26
+    COLPOINT_PIECETYPE_PED_ZONE_LEG_L,    // 27
+    COLPOINT_PIECETYPE_PED_ZONE_LEG_R,    // 28
+    COLPOINT_PIECETYPE_PED_ZONE_HEAD,     // 29
+    COLPOINT_PIECETYPE_LAST               // 30 — sentinel
+};
+```
+
+<AccordionGroup>
+  <Accordion title="Vehicle piece types (1–19)">
+    Values 1–19 map directly to destructible vehicle panels and wheels. The damage system reads `m_nPieceType` from the `CColPoint` to determine which panel to deform or detach.
+
+    | Value | Constant | Description |
+    |-------|----------|-------------|
+    | 1 | `COLPOINT_PIECETYPE_BONNET` | Hood / bonnet |
+    | 2 | `COLPOINT_PIECETYPE_TRUNK` | Boot / trunk lid |
+    | 3 | `COLPOINT_PIECETYPE_FRONTBUMPER` | Front bumper |
+    | 4 | `COLPOINT_PIECETYPE_REARBUMPER` | Rear bumper |
+    | 5 | `COLPOINT_PIECETYPE_FRONTLEFTDOOR` | Front-left door |
+    | 6 | `COLPOINT_PIECETYPE_FRONTRIGHTDOOR` | Front-right door |
+    | 7 | `COLPOINT_PIECETYPE_REARLEFTDOOR` | Rear-left door |
+    | 8 | `COLPOINT_PIECETYPE_REARRIGHTDOOR` | Rear-right door |
+    | 9 | `COLPOINT_PIECETYPE_FRONTLEFTWING` | Front-left wing/fender |
+    | 10 | `COLPOINT_PIECETYPE_FRONTRIGHTWING` | Front-right wing/fender |
+    | 11 | `COLPOINT_PIECETYPE_REARLEFTWING` | Rear-left wing/fender |
+    | 12 | `COLPOINT_PIECETYPE_REARRIGHTWING` | Rear-right wing/fender |
+    | 13 | `COLPOINT_PIECETYPE_FRONTLEFTWHEEL` | Front-left wheel |
+    | 14 | `COLPOINT_PIECETYPE_FRONTRIGHTWHEEL` | Front-right wheel |
+    | 15 | `COLPOINT_PIECETYPE_REARLEFTWHEEL` | Rear-left wheel |
+    | 16 | `COLPOINT_PIECETYPE_REARRIGHTWHEEL` | Rear-right wheel |
+    | 17 | `COLPOINT_PIECETYPE_FRONTBIKEWHEEL` | Bike front wheel |
+    | 18 | `COLPOINT_PIECETYPE_REARBIKEWHEEL` | Bike rear wheel |
+    | 19 | `COLPOINT_PIECETYPE_WINDSCREEN` | Windscreen glass |
+  </Accordion>
+  <Accordion title="Ped sphere and zone types (20–29)">
+    Values 20–22 correspond to the three broad collision spheres used for ped movement and vehicle interaction. Values 23–29 are finer-grained hit zones used by the damage, audio, and animation systems.
+
+    | Value | Constant | Description |
+    |-------|----------|-------------|
+    | 20 | `COLPOINT_PIECETYPE_PED_SPHERE_LEG` | Leg sphere |
+    | 21 | `COLPOINT_PIECETYPE_PED_SPHERE_MID` | Torso sphere |
+    | 22 | `COLPOINT_PIECETYPE_PED_SPHERE_HEAD` | Head sphere |
+    | 23 | `COLPOINT_PIECETYPE_PED_ZONE_CHEST` | Chest hit zone |
+    | 24 | `COLPOINT_PIECETYPE_PED_ZONE_MIDSECTION` | Midsection hit zone |
+    | 25 | `COLPOINT_PIECETYPE_PED_ZONE_UPPERARM_L` | Left upper arm |
+    | 26 | `COLPOINT_PIECETYPE_PED_ZONE_UPPERARM_R` | Right upper arm |
+    | 27 | `COLPOINT_PIECETYPE_PED_ZONE_LEG_L` | Left leg |
+    | 28 | `COLPOINT_PIECETYPE_PED_ZONE_LEG_R` | Right leg |
+    | 29 | `COLPOINT_PIECETYPE_PED_ZONE_HEAD` | Head zone |
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## CColPoint
+
+`CColPoint` records a single contact point produced by a successful intersection test. The caller receives one or more of these to drive physics impulses, damage events, and audio/particle effects.
+
+```cpp col_point.hpp
+class CColPoint
+{
+public:
+    // --- position ---
+    void    SetPosition(f32 x, f32 y, f32 z);
+    void    SetPosition(const CVector& vec);
+    CVector& GetPosition();
+
+    // --- normal ---
+    void    SetNormal(f32 x, f32 y, f32 z);
+    void    SetNormal(const CVector& vec);
+    CVector& GetNormal();
+
+    // --- object A metadata ---
+    void    SetDataA(const ColData& data);
+    ColData GetDataA();
+    void    SetSurfaceTypeA(u8 nSurfaceType);
+    u8      GetSurfaceTypeA();
+    void    SetPieceTypeA(u8 nPieceType);
+    u8      GetPieceTypeA();
+    void    SetLightingA(u8 nLighting);
+    u8      GetLightingA();
+
+    // --- object B metadata ---
+    void    SetDataB(const ColData& data);
+    ColData GetDataB();
+    void    SetSurfaceTypeB(u8 nSurfaceType);
+    u8      GetSurfaceTypeB();
+    void    SetPieceTypeB(u8 nPieceType);
+    u8      GetPieceTypeB();
+    void    SetLightingB(u8 nLighting);
+    u8      GetLightingB();
+
+    // --- penetration depth ---
+    void SetDepth(f32 fDepth);
+    f32  GetDepth();
+
+    CColPoint& operator=(const CColPoint& p);
+
+private:
+    CVector m_vecPosition;   // Contact point in world space
+    f32     pad;             // Alignment padding
+    CVector m_vecNormal;     // Outward normal at contact (points from B to A)
+    f32     pad2;            // Alignment padding
+    ColData m_dataA;         // Surface metadata for object A's primitive
+    ColData m_dataB;         // Surface metadata for object B's primitive
+    f32     m_fDepth;        // Penetration depth (positive = overlapping)
+};
+```
+
+## dataA and dataB explained
+
+Every contact involves two objects. `m_dataA` carries the `ColData` of the specific primitive on **object A** that was struck — its surface type, piece type, and lighting. `m_dataB` carries the same information for **object B**. This separation lets the response code apply the correct material sounds and effects for both sides of the contact simultaneously.
+
+For example, when a car (object A, `COLPOINT_PIECETYPE_FRONTLEFTDOOR`, metal surface) strikes a concrete wall (object B, `COLPOINT_PIECETYPE_DEFAULT`, concrete surface), the audio system plays a metal-on-concrete scrape rather than a generic impact.
+
+## Fields (private, accessed via methods)
+
+<ResponseField name="m_vecPosition" type="CVector">
+  The world-space contact point. Access via `GetPosition()` / `SetPosition()`.
+</ResponseField>
+
+<ResponseField name="m_vecNormal" type="CVector">
+  The outward surface normal at the contact point. Points away from object B and toward object A (i.e., in the direction of the separating impulse). Access via `GetNormal()` / `SetNormal()`.
+</ResponseField>
+
+<ResponseField name="m_dataA" type="ColData">
+  Surface type, piece type, and lighting for the primitive on object A. Access the individual fields via `SetSurfaceTypeA()`, `SetPieceTypeA()`, `SetLightingA()` and their `Get*` counterparts, or replace the entire block with `SetDataA()`.
+</ResponseField>
+
+<ResponseField name="m_dataB" type="ColData">
+  Surface type, piece type, and lighting for the primitive on object B. Same accessors as `m_dataA` with the `B` suffix.
+</ResponseField>
+
+<ResponseField name="m_fDepth" type="f32">
+  How far the two primitives overlap along the contact normal. A larger value means a deeper interpenetration and typically produces a stronger corrective impulse. Access via `GetDepth()` / `SetDepth()`.
+</ResponseField>
+
+## Methods
+
+### Position
+
+<ResponseField name="SetPosition(f32, f32, f32)" type="void">
+  Sets the contact position from three scalar components.
+</ResponseField>
+
+<ResponseField name="SetPosition(const CVector&)" type="void">
+  Sets the contact position from a vector.
+</ResponseField>
+
+<ResponseField name="GetPosition" type="CVector&">
+  Returns a mutable reference to the contact position.
+</ResponseField>
+
+### Normal
+
+<ResponseField name="SetNormal(f32, f32, f32)" type="void">
+  Sets the contact normal from three scalar components. The caller is responsible for ensuring the vector is unit length.
+</ResponseField>
+
+<ResponseField name="SetNormal(const CVector&)" type="void">
+  Sets the contact normal from a vector.
+</ResponseField>
+
+<ResponseField name="GetNormal" type="CVector&">
+  Returns a mutable reference to the contact normal.
+</ResponseField>
+
+### Object A metadata
+
+<ResponseField name="SetDataA / GetDataA" type="void / ColData">
+  Bulk set or get all three metadata fields for object A in a single `ColData` struct.
+</ResponseField>
+
+<ResponseField name="SetSurfaceTypeA / GetSurfaceTypeA" type="void / u8">
+  Individual access for `m_dataA.m_nSurfaceType`.
+</ResponseField>
+
+<ResponseField name="SetPieceTypeA / GetPieceTypeA" type="void / u8">
+  Individual access for `m_dataA.m_nPieceType`. Use `eColPieceType` values.
+</ResponseField>
+
+<ResponseField name="SetLightingA / GetLightingA" type="void / u8">
+  Individual access for `m_dataA.m_lighting` (packed day/night byte).
+</ResponseField>
+
+### Object B metadata
+
+The `SetDataB`, `SetSurfaceTypeB`, `SetPieceTypeB`, and `SetLightingB` methods (and their `Get*` counterparts) work identically to the A-side accessors, targeting `m_dataB` instead.
+
+### Depth
+
+<ResponseField name="SetDepth / GetDepth" type="void / f32">
+  Set or retrieve the penetration depth. Depth is always non-negative; zero means tangential contact with no overlap.
+</ResponseField>
+
+## Example — reading a collision result
+
+```cpp
+CColPoint result;
+f32 maxDepth = 1.0f;
+
+if (ProcessSphereSphere(sphereA, sphereB, result, maxDepth))
+{
+    CVector pos    = result.GetPosition();
+    CVector normal = result.GetNormal();
+    f32     depth  = result.GetDepth();
+
+    // Identify which vehicle part was hit on object A
+    u8 pieceA = result.GetPieceTypeA(); // e.g. COLPOINT_PIECETYPE_FRONTLEFTDOOR
+
+    // Identify the surface struck on object B
+    u8 surfaceB = result.GetSurfaceTypeB(); // e.g. SURFACE_TYPE_CONCRETE
+
+    // Apply impulse along the normal, proportional to penetration depth ...
+}
+```

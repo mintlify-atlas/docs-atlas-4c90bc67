@@ -1,0 +1,158 @@
+---
+title: 'CBox and CColBox — axis-aligned bounding box primitives'
+description: 'Axis-aligned bounding box primitives for GTA:SA collision: CBox stores min/max corners, CColBox adds ColData for surface, piece, and lighting metadata.'
+---
+
+Box primitives represent axis-aligned bounding boxes (AABBs) defined by two corner points — a minimum and a maximum. `CBox` provides the raw geometric volume, while `CColBox` adds the surface metadata needed for collision response. Because the extents are always aligned to the world axes, AABB intersection tests are very fast, making boxes useful both as final-geometry primitives and as broad-phase culling volumes.
+
+## Class hierarchy
+
+```
+CBox          (0x18)
+└── CColBox   (0x1C)
+```
+
+## CBox
+
+`CBox` is a minimal geometric AABB with no collision metadata. It stores a minimum corner and a maximum corner, each as a `CVector`.
+
+```cpp col_box.hpp
+class CBox
+{
+public:
+    CVector m_vecMin;   // Minimum corner (x, y, z)
+    CVector m_vecMax;   // Maximum corner (x, y, z)
+
+    void Set(const CVector& vecMin, const CVector& vecMax);
+    void Recalc();
+};
+CHECK_SIZE_X86(CBox, 0x18);
+```
+
+### Fields
+
+<ResponseField name="m_vecMin" type="CVector">
+  The corner of the box with the smallest x, y, and z coordinates in local or world space.
+</ResponseField>
+
+<ResponseField name="m_vecMax" type="CVector">
+  The corner of the box with the largest x, y, and z coordinates.
+</ResponseField>
+
+### Methods
+
+<ResponseField name="Set" type="void">
+  Assigns new minimum and maximum corners.
+
+  <ParamField path="vecMin" type="const CVector&" required>
+    New minimum extent.
+  </ParamField>
+  <ParamField path="vecMax" type="const CVector&" required>
+    New maximum extent.
+  </ParamField>
+</ResponseField>
+
+<ResponseField name="Recalc" type="void">
+  Recomputes derived properties from the current `m_vecMin` and `m_vecMax` values. Call this after manually modifying the corner fields.
+</ResponseField>
+
+---
+
+## CColBox
+
+`CColBox` inherits `CBox` and adds a `ColData` block that describes the material, piece, and lighting properties of the box surface.
+
+```cpp col_box.hpp
+class CColBox : public CBox
+{
+public:
+    void Set(const CVector& vecMin, const CVector& vecMax,
+             u8 nSurfaceType, u8 nPieceType, u8 nLighting);
+
+    CColBox& operator=(const CColBox& s);
+
+    ColData m_data;
+};
+CHECK_SIZE_X86(CColBox, 0x1C);
+```
+
+### The ColData block
+
+```cpp col_data.hpp
+struct ColData
+{
+    u8 m_nSurfaceType;  // Material surface ID
+    u8 m_nPieceType;    // eColPieceType — which part of the object
+    u8 m_lighting;      // Packed day/night lighting nibbles
+};
+CHECK_SIZE_X86(ColData, 0x3);
+```
+
+### Methods
+
+<ResponseField name="Set" type="void">
+  Initialises the AABB extents and all collision metadata in a single call.
+
+  <ParamField path="vecMin" type="const CVector&" required>
+    Minimum corner of the box.
+  </ParamField>
+  <ParamField path="vecMax" type="const CVector&" required>
+    Maximum corner of the box.
+  </ParamField>
+  <ParamField path="nSurfaceType" type="u8" required>
+    Surface material ID. Determines friction, impact sound, and particle effects on collision.
+  </ParamField>
+  <ParamField path="nPieceType" type="u8" required>
+    Piece type from `eColPieceType`. Identifies which region of a vehicle or object this box represents.
+  </ParamField>
+  <ParamField path="nLighting" type="u8" required>
+    Packed lighting byte. Upper nibble is night brightness; lower nibble is day brightness.
+  </ParamField>
+</ResponseField>
+
+<ResponseField name="operator=" type="CColBox&">
+  Deep-copies another `CColBox`, including both corner vectors and the `ColData` block.
+
+  <ParamField path="s" type="const CColBox&" required>
+    Source box to copy from.
+  </ParamField>
+</ResponseField>
+
+### Example — setting a vehicle door box
+
+```cpp
+#include "game/collision/col_box.hpp"
+
+CColBox doorBox;
+doorBox.Set(
+    CVector(-0.5f, -0.1f, 0.0f),   // min corner (local space)
+    CVector( 0.5f,  0.1f, 1.2f),   // max corner (local space)
+    SURFACE_TYPE_CAR_PANEL,         // metal panel surface
+    COLPOINT_PIECETYPE_FRONTLEFTDOOR,
+    0x88                            // mid-range day and night lighting
+);
+```
+
+---
+
+## AABB broad-phase culling
+
+Before expensive per-triangle or per-sphere tests, the collision system uses an AABB overlap test to eliminate objects that cannot possibly intersect. Two AABBs overlap if and only if:
+
+```cpp
+bool AABBOverlap(const CBox& a, const CBox& b)
+{
+    return a.m_vecMin.x <= b.m_vecMax.x && a.m_vecMax.x >= b.m_vecMin.x &&
+           a.m_vecMin.y <= b.m_vecMax.y && a.m_vecMax.y >= b.m_vecMin.y &&
+           a.m_vecMin.z <= b.m_vecMax.z && a.m_vecMax.z >= b.m_vecMin.z;
+}
+```
+
+Because all six comparisons operate on scalar values with no square roots or trigonometry, this test is significantly cheaper than sphere-sphere or mesh tests, making it the standard first pass before narrowing to specific primitives.
+
+## Memory layout
+
+| Class | Size (x86) | Notes |
+|-------|-----------|-------|
+| `CBox` | `0x18` (24 bytes) | Two `CVector` values (12 bytes each) |
+| `CColBox` | `0x1C` (28 bytes) | Adds `ColData` (3 bytes) + 1 byte padding |

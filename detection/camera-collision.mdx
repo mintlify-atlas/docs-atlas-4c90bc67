@@ -1,0 +1,221 @@
+---
+title: "Camera collision: swept sphere cast and entity cache"
+description: "Reference for CCollision's camera subsystem — sphere sweep casts, per-category entity checks, the two-frame cache, and the four static enable flags."
+---
+
+The camera-collision subsystem prevents the game camera from clipping through geometry by sweeping a sphere (or a pair of spheres representing the start and end positions) through the world and reporting the nearest obstruction. It is built around a two-frame cache to avoid querying the full entity list every frame, and is gated by four static boolean flags that control which entity categories participate.
+
+## Static enable flags
+
+```cpp
+static bool bCamCollideWithVehicles;
+static bool bCamCollideWithObjects;
+static bool bCamCollideWithBuildings;
+static bool bCamCollideWithPeds;
+```
+
+Each flag independently enables or disables camera collision against the named entity category. Disabling `bCamCollideWithBuildings` is unusual but can be set at runtime — for example, during a cinematic sequence where the camera intentionally passes through walls.
+
+## The two-sphere sweep model
+
+Most camera-collision functions take two sphere parameters, `pA` and `pB`:
+
+- **`pA`** — the camera sphere at its current (start) position.
+- **`pB`** — the camera sphere at its desired (end) position after the move.
+
+The swept volume between the two sphere positions is the region that must be free of obstruction. A `pDist` or `pNearestDist` output parameter receives the parametric distance `[0, 1]` along the sweep at which the first contact was found.
+
+## Top-level entry point
+
+### CameraConeCastVsWorldCollision
+
+```cpp
+static bool CameraConeCastVsWorldCollision(
+    CColSphere* pA,
+    CColSphere* pB,
+    f32*        pDist,
+    f32         minDist);
+```
+
+The primary camera-collision call. It sweeps the sphere from `pA` to `pB` against all geometry in the world, filtered by the four static flags. `minDist` is the closest distance the camera is allowed to be from the player model; contacts nearer than this are ignored. Returns `true` when any obstruction is found and writes the normalised hit distance to `*pDist`.
+
+## Cache management
+
+### BuildCacheOfCameraCollision
+
+```cpp
+static bool BuildCacheOfCameraCollision(CColSphere* pA, CColSphere* pB);
+```
+
+Populates the internal `CColCacheEntry` array with all entities and their individual primitives (triangles, spheres, boxes) that overlap the bounding box of the two-sphere sweep. The cache is rebuilt every frame during the camera update, allowing `SphereCastVsCaches` to iterate a compact list rather than the full world.
+
+### GetBoundingBoxFromTwoSpheres
+
+```cpp
+static void GetBoundingBoxFromTwoSpheres(
+    CColBox*    pBox,
+    CColSphere* pA,
+    CColSphere* pB);
+```
+
+Computes the axis-aligned bounding box that tightly encloses both `pA` and `pB`, accounting for their radii. The result is written to `*pBox` and is used as the broad-phase volume for entity queries in `BuildCacheOfCameraCollision`.
+
+## Per-category collision checks
+
+These functions iterate one entity category in the world grid around tile `(X, Y)` and test each entity against the sweep volume defined by `pBox`, `pSph`, `pA`, and `pB`.
+
+### CheckCameraCollisionObjects
+
+```cpp
+static bool CheckCameraCollisionObjects(
+    i32         X, i32 Y,
+    CColBox*    pBox,
+    CColSphere* pSph,
+    CColSphere* pA,
+    CColSphere* pB);
+```
+
+Tests dynamic and static objects. Checks enabled only when `bCamCollideWithObjects` is `true`.
+
+### CheckCameraCollisionBuildings
+
+```cpp
+static bool CheckCameraCollisionBuildings(
+    i32         X, i32 Y,
+    CColBox*    pBox,
+    CColSphere* pSph,
+    CColSphere* pA,
+    CColSphere* pB);
+```
+
+Tests building (IPL-placed) geometry. Checks enabled only when `bCamCollideWithBuildings` is `true`.
+
+### CheckCameraCollisionVehicles
+
+```cpp
+static bool CheckCameraCollisionVehicles(
+    i32         X, i32 Y,
+    CColBox*    pBox,
+    CColSphere* pSph,
+    CColSphere* pA,
+    CColSphere* pB,
+    CVector*    pMyVel);
+```
+
+Tests vehicles. The extra `pMyVel` parameter is the camera's velocity vector; it is used to compare relative speed against `relVelCamCollisionVehiclesSqr` — contacts with a vehicle that is moving in nearly the same direction as the camera are suppressed to avoid jitter. Checks enabled only when `bCamCollideWithVehicles` is `true`.
+
+### CheckCameraCollisionPeds
+
+```cpp
+static bool CheckCameraCollisionPeds(
+    i32      X, i32 Y,
+    CVector* pPos,
+    CVector* pNorm,
+    f32*     pNearestDist);
+```
+
+Tests pedestrians. Unlike the other category functions it does not take sphere sweep parameters; instead it works with a ray origin `pPos` and writes the nearest contact normal and distance. Checks enabled only when `bCamCollideWithPeds` is `true`.
+
+### CheckPeds
+
+```cpp
+static bool CheckPeds(
+    CVector* pSource,
+    CVector* pNorm,
+    f32*     pNearest);
+```
+
+Lower-level pedestrian check called by `CheckCameraCollisionPeds`. It iterates all peds and delegates to `SphereVsEntity` for the actual intersection test.
+
+## Sphere-cast primitives
+
+### SphereCastVsSphere
+
+```cpp
+static bool SphereCastVsSphere(
+    CColSphere* pA,
+    CColSphere* pB,
+    CColSphere* pS);
+```
+
+Tests the swept volume of the camera sphere (from `pA` to `pB`) against a stationary sphere `pS`. Returns `true` if any part of the sweep overlaps `pS`.
+
+### SphereCastVersusVsPoly
+
+```cpp
+static bool SphereCastVersusVsPoly(
+    CColSphere*      pA,
+    CColSphere*      pB,
+    CColTriangle*    pP,
+    CColTrianglePlane* pPlane,
+    CollisionVector* pVerts);
+```
+
+Tests the sphere sweep against a single triangle described by `pP`, its pre-computed plane `pPlane`, and the compressed vertex array `pVerts`. This is the inner loop called for every triangle in the cache.
+
+### SphereCastVsEntity
+
+```cpp
+static bool SphereCastVsEntity(
+    CColSphere* pA,
+    CColSphere* pB,
+    CEntity*    pEntity);
+```
+
+Tests the sweep against all primitives in `pEntity`'s active collision model. This is the per-entity entry point used before the cache is fully warmed.
+
+### SphereCastVsCaches
+
+```cpp
+static bool SphereCastVsCaches(
+    CColSphere*     pA,
+    CVector*        pVel,
+    i32             numTest,
+    CColCacheEntry* pTest,
+    i32*            pNumWrite,
+    CColCacheEntry* pWrite);
+```
+
+Iterates the pre-built cache array `pTest[numTest]` and tests each entry against the sweep sphere `pA` moving by velocity `pVel`. Entries that survive the test are written into `pWrite[*pNumWrite]`, building a refined cache for subsequent passes. This staged refinement avoids testing the same geometry twice per frame.
+
+### SphereCastVsBBox
+
+```cpp
+static bool SphereCastVsBBox(
+    CColSphere* pA,
+    CColSphere* pB,
+    CColBox*    pBox);
+```
+
+Broad-phase test: checks whether the bounding box of the sphere sweep overlaps `pBox`. Used to cull entities before running the expensive per-primitive tests.
+
+## Simple sphere test
+
+### SphereVsEntity
+
+```cpp
+static bool SphereVsEntity(
+    CColSphere* pA,
+    CEntity*    pEntity);
+```
+
+Static sphere overlap test (no sweep) against all primitives of `pEntity`. Used by `CheckPeds` and similar lightweight proximity queries that do not require a swept volume.
+
+## Call flow summary
+
+The following shows how the subsystem fits together in a single camera update:
+
+<Steps>
+  <Step title="Compute bounding box">
+    `GetBoundingBoxFromTwoSpheres` wraps `pA` and `pB` into a query AABB.
+  </Step>
+  <Step title="Build entity cache">
+    `BuildCacheOfCameraCollision` queries each enabled category (`CheckCameraCollisionBuildings`, `CheckCameraCollisionVehicles`, etc.) and fills `CColCacheEntry` arrays with every candidate primitive.
+  </Step>
+  <Step title="Sweep against cache">
+    `SphereCastVsCaches` iterates the cache entries, calls `SphereCastVsSphere` for spheres, `SphereCastVersusVsPoly` for triangles, and `SphereCastVsBBox` for boxes.
+  </Step>
+  <Step title="Report nearest hit">
+    `CameraConeCastVsWorldCollision` collects the minimum distance and returns it to the camera system, which clips the camera position along the sweep vector.
+  </Step>
+</Steps>

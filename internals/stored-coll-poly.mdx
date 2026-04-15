@@ -1,0 +1,93 @@
+---
+title: "CStoredCollPoly: cached triangle for ground queries"
+description: "44-byte struct that caches the last triangle tested by a vertical line query so the engine can skip re-testing identical geometry on consecutive frames."
+---
+
+Vertical line queries — used to place vehicles, pedestrians, and objects on the ground — are among the most frequent collision tests in the engine. When the same entity stands on the same surface between frames, it is wasteful to re-test every triangle in the mesh from scratch. `CStoredCollPoly` solves this by caching the three world-space vertices and packed lighting of the last valid triangle hit, so the next query can validate and reuse it without a full mesh traversal.
+
+## Struct definition
+
+```cpp
+struct CStoredCollPoly
+{
+    CVector V1;              // first vertex of the cached triangle (world space)
+    CVector V2;              // second vertex
+    CVector V3;              // third vertex
+    bool    bValidPolyStored; // false if no triangle has been cached yet
+    u32     lighting;        // packed lighting of the cached surface
+};
+CHECK_SIZE_X86(CStoredCollPoly, 0x2C);
+```
+
+`CHECK_SIZE_X86` confirms the layout is exactly 44 bytes (0x2C) on x86. Each `CVector` is 12 bytes (three `f32` values), giving 36 bytes for the three vertices, plus 1 byte for `bValidPolyStored`, 3 bytes of natural alignment padding, and 4 bytes for `lighting`.
+
+## Fields
+
+### `V1`, `V2`, `V3`
+
+The three vertices are stored in world space, not model space. This is intentional: the validity check compares the cached triangle against the actual world-space geometry at the candidate position, so no model-to-world transform is needed at validation time.
+
+```cpp
+CVector V1;  // 12 bytes — offset 0x00
+CVector V2;  // 12 bytes — offset 0x0C
+CVector V3;  // 12 bytes — offset 0x18
+```
+
+### `bValidPolyStored`
+
+This flag is `false` when the cache is empty (initial state or after an explicit invalidation). Any code that reads `V1`/`V2`/`V3` must check this flag first. A `false` value means the system must fall back to a full mesh traversal for the next query.
+
+```cpp
+bool bValidPolyStored;  // 1 byte — offset 0x24
+```
+
+### `lighting`
+
+The packed lighting word is copied directly from `CColTriangle::m_nLighting` (a `u8` stored in the lower byte, upper bytes unused at rest) when the triangle is first hit. It is preserved in the cache so that the lighting value for the cached surface can be reused alongside the geometry without re-reading the original triangle data.
+
+```cpp
+u32 lighting;  // 4 bytes — offset 0x28
+```
+
+<Note>
+The `lighting` field uses the same nibble encoding as `ColData::m_lighting` — lower nibble is day intensity (0–15), upper nibble is night intensity (0–15). See the [ColData](/internals/col-data) page for the full calculation.
+</Note>
+
+## How it is used
+
+### `ProcessVerticalLineTriangle`
+
+When the engine tests a vertical downward ray against a triangle mesh, `ProcessVerticalLineTriangle` writes the hit triangle's world-space vertices and lighting into a `CStoredCollPoly` if the test succeeds. On the next call, the stored poly is tested first via `IsStoredPolyStillValidVerticalLine`.
+
+### `ProcessLineTriangle`
+
+The non-vertical line variant (`ProcessLineTriangle`) follows the same pattern. It populates the cached poly on a hit and defers to the stored poly check on subsequent frames.
+
+### `IsStoredPolyStillValidVerticalLine`
+
+Before the full mesh traversal begins, the engine calls `IsStoredPolyStillValidVerticalLine` to see whether the cached triangle still intersects the query line. The check works as follows:
+
+1. If `bValidPolyStored` is `false`, return immediately — no cached triangle.
+2. Reconstruct the plane from `V1`, `V2`, `V3`.
+3. Test whether the query line intersects that plane within the triangle bounds.
+4. If the intersection is still valid, return the cached result without touching the mesh arrays.
+
+This early-out is especially valuable for stationary entities on flat terrain, where the stored poly remains valid for many consecutive frames.
+
+## Memory layout
+
+```text
+Offset   Size   Field
+------   ----   -----
+0x00     12     V1  (CVector)
+0x0C     12     V2  (CVector)
+0x18     12     V3  (CVector)
+0x24      1     bValidPolyStored (bool)
+0x25      3     (padding)
+0x28      4     lighting (u32)
+0x2C     —      end
+```
+
+<Tip>
+When you see unexpected collision results on flat surfaces, check whether `bValidPolyStored` is `true` but `V1`/`V2`/`V3` contain stale world-space coordinates from a previous model position. Moving or rotating the owning entity without invalidating the cache is a common source of one-frame collision glitches.
+</Tip>

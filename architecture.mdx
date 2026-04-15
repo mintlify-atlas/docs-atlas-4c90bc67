@@ -1,0 +1,263 @@
+---
+title: "Architecture of the GTA:SA C++ collision detection"
+description: "Class hierarchy, data-flow pipeline, x86 memory layout, broad- vs narrow-phase strategy, and compressed triangle storage used throughout the system."
+---
+
+The GTA:SA collision system is structured as a strict hierarchy of ownership: game entities hold collision models, collision models own collision data containers, and those containers own the raw primitive arrays that the detection engine operates on. Understanding that chain — and the memory sizes that go with each node — is the foundation for reading any code in this codebase.
+
+## Class hierarchy
+
+The diagram below shows the inheritance and composition relationships among all major types.
+
+```
+CEntity
+└── CPhysical  (0x138 bytes)          ← base of all simulated objects
+    │   owns: CColModel* (via archetype / special col model)
+    │
+    └── CVehicle, CPed, CObject, ...
+
+CBoundingBox  (0x28 bytes)            ← bounding sphere + AABB for broad-phase
+└── CColModel  (0x30 bytes)           ← per-model collision container
+        │   m_level   : u8
+        │   m_pColData: CCollisionData*
+        │
+        └── CCollisionData  (0x30 bytes)
+                │   m_nNoOfSpheres    : i16 → CColSphere[]   (0x14 each)
+                │   m_nNoOfBoxes      : i16 → CColBox[]      (0x1C each)
+                │   m_nNoOfTriangles  : i16 → CColTriangle[]
+                │   m_nNoOfLines      : i8  → CColLine[]     (0x20 each)
+                │   m_pTriCompressedVectorArray : CollisionVector*
+                │   m_pTriangleArray           : CColTriangle*
+                │   m_pTrianglePlaneArray       : CColTrianglePlane* (0x0A each)
+                │   m_pShadTriangleArray        : CColTriangle*
+                └── (shadow vertex / triangle arrays for rendering)
+
+CColStore                             ← streaming manager
+    │   ms_pColPool  : CPool<ColDef>* ← named .col file slots (0x2C each)
+    │   ms_pQuadTree : CQuadTreeNode* ← spatial lookup by world position
+    │
+    └── ColDef
+            name[18], bb: CRect
+            firstModel, lastModel: i16
+            refCount: i16
+            loaded, required, inMemoryAlways, interior: bool
+
+CColAccel                             ← load-time cache
+    │   mp_caccColItems : CColAccelItem*   ← cached CColModel bounds + index
+    └── mp_caccIPLItems : CIplAccelItem*   ← cached IPL entity records
+
+CCollision  (static)                  ← detection engine; no instance state
+CColPoint                             ← result of a process call
+    position: CVector, normal: CVector
+    dataA, dataB: ColData (surface/piece/lighting)
+    m_fDepth: f32
+```
+
+## x86 memory layout
+
+These sizes come directly from `CHECK_SIZE_X86` macros in the source. Any code that reads or writes these structures in a running GTA:SA process must match them exactly.
+
+| Type | x86 size | Notes |
+|---|---|---|
+| `CSphere` | 0x10 | centre `CVector` (12 B) + `f32` radius |
+| `CColSphere` | 0x14 | `CSphere` + `ColData` (3 B + 1 pad) |
+| `CBox` | 0x18 | two `CVector` min/max |
+| `CColBox` | 0x1C | `CBox` + `ColData` |
+| `CColLine` | 0x20 | start + end `CVector`, each padded to 16 B |
+| `CColTrianglePlane` | 0x0A | `CollisionVector` (6 B) + `CollisionFloat` (2 B) + axis byte + pad |
+| `CBoundingBox` | 0x28 | `CBox` (0x18) + `CSphere` (0x10) |
+| `CCollisionData` | 0x30 | six count fields + eight pointers |
+| `CColModel` | 0x30 | `CBoundingBox` (0x28) + level/flags/pointer |
+| `CColModelSection` | 0x1C | `CBox` + two `i16` indices |
+| `ColDef` | 0x2C | rect + name\[18\] + model range + flags |
+| `CIplAccelItem` | 0x14 | five `i32` fields |
+| `CPhysical` | 0x138 | full dynamics state on top of `CEntity` |
+
+<Note>
+  `CCollisionData` and `CColModel` both report 0x30 bytes on x86, but they are unrelated by inheritance. `CColModel` contains a pointer to `CCollisionData`; their identical sizes are coincidental.
+</Note>
+
+## Data flow pipeline
+
+The steps below trace a collision query from cold storage to a resolved contact point.
+
+<Steps>
+  <Step title="Spatial lookup in CColStore">
+    When the player moves, `CColStore::RequestCollision()` queries `ms_pQuadTree` with the player's world position and area code to identify which `ColDef` slots need to be resident. `SetCollisionRequired()` marks the required slots; `LoadCollision()` then drives the actual file I/O.
+
+    ```cpp
+    static void CColStore::RequestCollision(const CVector& posn, i32 areaCode);
+    static void CColStore::LoadCollision(CVector posn, bool bLoadScene);
+    ```
+  </Step>
+
+  <Step title="File parse and CColModel construction">
+    `CColStore::LoadCol()` reads the binary `.col` file from disk (or a supplied buffer) and constructs the `CColModel` objects referenced by `ColDef::firstModel`..`ColDef::lastModel`. Each `CColModel` calls `AllocateData()` to allocate its `CCollisionData` and the primitive arrays within it.
+
+    ```cpp
+    static bool CColStore::LoadCol(i32 index, u8* pBuffer, i32 size);
+
+    void CColModel::AllocateData(
+        i32 numSpheres, i32 numBoxes, i32 numLines,
+        i32 numVertices, i32 numTriangles,
+        bool bUseDisksNotLines);
+    ```
+  </Step>
+
+  <Step title="Acceleration cache (CColAccel)">
+    If the cache is active (`CColAccel::isCacheLoading()` returns true), `addCacheCol()` records each parsed `CColModel` as a `CColAccelItem` — bounding box, model index, level, and collision-volume presence flag — so subsequent loads can skip full re-parsing.
+
+    ```cpp
+    static void CColAccel::addCacheCol(i32 iModelIndex, const CColModel& r_colModel);
+    ```
+  </Step>
+
+  <Step title="Triangle plane pre-computation">
+    Triangle plane normals are not stored in the `.col` file; they are derived on first use. `CCollision::CalculateTrianglePlanes()` walks `CCollisionData::m_pTriangleArray`, decompresses each vertex from `m_pTriCompressedVectorArray`, computes the normal, and stores it compressed into `m_pTrianglePlaneArray` as a `CColTrianglePlane`.
+
+    ```cpp
+    static void CCollision::CalculateTrianglePlanes(CColModel* pModel);
+    static void CCollision::CalculateTrianglePlanes(CCollisionData* pColData);
+    ```
+  </Step>
+
+  <Step title="Broad-phase rejection">
+    Before testing any individual primitive, `CCollision::ProcessColModels()` checks the bounding sphere of each `CColModel` (from `CBoundingBox::GetBoundSphere()`) transformed into world space. If the spheres do not overlap, the entire model pair is discarded. If they do, the bounding boxes (`CBoundingBox::GetBoundBox()`) are checked next.
+
+    ```cpp
+    static i32 CCollision::ProcessColModels(
+        const CMatrix& matA, CColModel& colModelA,
+        const CMatrix& matB, CColModel& colModelB,
+        CColPoint* aColPoints, ...);
+    ```
+  </Step>
+
+  <Step title="Narrow-phase primitive tests">
+    For model pairs that pass the broad phase, `ProcessColModels()` iterates every primitive in `CCollisionData`. Sphere–sphere and sphere–box paths call the corresponding `TestSphere*` and `ProcessSphere*` overloads. Triangle paths require decompressing the three vertex indices and calling `ProcessSphereTriangle()` or `ProcessLineTriangle()` with the pre-computed `CColTrianglePlane`.
+
+    ```cpp
+    static bool CCollision::ProcessSphereSphere(
+        const CColSphere& sphereA, const CColSphere& sphereB,
+        CColPoint& colPoint, f32& fDistanceSqr);
+
+    static bool CCollision::ProcessSphereTriangle(
+        const CColSphere& sphere, const CollisionVector* aVectors,
+        const CColTriangle& triangle, const CColTrianglePlane& plane,
+        CColPoint& colPoint, f32& fDistanceSqr);
+    ```
+  </Step>
+
+  <Step title="CColPoint result">
+    A successful process call fills a `CColPoint` with the contact position (`m_vecPosition`), outward normal (`m_vecNormal`), penetration depth (`m_fDepth`), and two `ColData` records (`m_dataA`, `m_dataB`) for the two surfaces involved. The caller — typically `CPhysical::ProcessEntityCollision()` — uses these values to compute and apply impulses.
+
+    ```cpp
+    class CColPoint
+    {
+        CVector m_vecPosition;  // world-space contact point
+        CVector m_vecNormal;    // surface normal at contact
+        ColData m_dataA;        // surface/piece/lighting for object A
+        ColData m_dataB;        // surface/piece/lighting for object B
+        f32     m_fDepth;       // penetration depth
+    };
+    ```
+  </Step>
+
+  <Step title="Physics response in CPhysical">
+    `CPhysical::ProcessCollision()` gathers all `CColPoint` results and dispatches them to `ApplyCollision()` or `ApplySpringCollision()`. These functions compute impulse magnitudes from mass, elasticity, and relative velocity, then update `m_vecMoveSpeed` and `m_vecTurnSpeed` accordingly.
+
+    ```cpp
+    virtual void CPhysical::ProcessCollision();
+    bool CPhysical::ApplyCollision(
+        CPhysical* pPhysical, CColPoint& colPoint,
+        f32& fImpulseMagnitudeA, f32& fImpulseMagnitudeB);
+    ```
+  </Step>
+</Steps>
+
+## Broad-phase vs narrow-phase strategy
+
+The engine applies a two-tier spatial filter before executing any per-primitive geometry test.
+
+<Tabs>
+  <Tab title="Broad phase">
+    The broad phase uses the `CBoundingBox` attached to every `CColModel`. It tests the bounding sphere first (a single distance-squared comparison), then the axis-aligned bounding box if the sphere test passes. Both tests operate in the local space of one object after transforming the other object's bounds using a relative `CMatrix`.
+
+    ```cpp
+    // CBoundingBox accessors used in broad-phase
+    const CSphere& CBoundingBox::GetBoundSphere() const;
+    const CBox&    CBoundingBox::GetBoundBox()    const;
+
+    // Fast AABB test available for line queries
+    static bool CCollision::TestLineBox_DW(const CColLine& line, const CBox& box);
+    static bool CCollision::TestVerticalLineBox(const CColLine& Line, const CBox& box);
+    ```
+
+    For line-of-sight and vertical line queries a further per-section optimisation is available: if `CCollisionData::m_useColModelSections` is set, the data carries `CColModelSection` records stored at negative offsets before `m_pTriangleArray`. Each section has its own `CBox`, and the narrow phase skips any section whose box does not intersect the query line.
+  </Tab>
+  <Tab title="Narrow phase">
+    Once the broad phase approves a pair, the narrow phase iterates the actual primitive arrays inside `CCollisionData`. Each sphere is tested against each box and triangle; each line is tested against each sphere, box, and triangle. The first test to succeed (`TestSphereSphere`, `TestSphereBox`, `TestSphereTriangle`, `TestLineSphere`, `TestLineBox`, `TestLineTriangle`) decides whether the more expensive process call is warranted.
+
+    ```cpp
+    static bool CCollision::TestSphereSphere(
+        const CColSphere& sphereA, const CColSphere& sphereB);
+
+    static bool CCollision::TestSphereTriangle(
+        const CColSphere& sphere,
+        const CollisionVector* aVectors,
+        const CColTriangle& triangle,
+        const CColTrianglePlane& plane);
+
+    static bool CCollision::TestLineTriangle(
+        const CColLine& line,
+        const CollisionVector* aVectors,
+        const CColTriangle& triangle,
+        const CColTrianglePlane& plane);
+    ```
+
+    Triangle vertices are never stored as full `f32` triples in `CCollisionData`. They live in the `m_pTriCompressedVectorArray` pool as `CollisionVector` (three `i16` components) and are decompressed to `CVector` only during a narrow-phase test.
+  </Tab>
+</Tabs>
+
+## Compressed storage
+
+GTA:SA compresses all triangle vertex positions and plane normals to reduce the memory footprint of large collision meshes.
+
+<AccordionGroup>
+  <Accordion title="CollisionVector — compressed vertex positions">
+    `CollisionVector` stores a 3D vector as three `i16` components (x, y, z). Vertex positions are quantised to a fixed-point scale; the decompressor in `CCollisionData::GetTrianglePoint()` rescales them to world-unit `f32` values. This halves the storage cost per vertex compared to a full `CVector`.
+
+    ```cpp
+    // Used for triangle vertex pools and triangle plane normals
+    CollisionVector* m_pTriCompressedVectorArray;   // offset 0x14
+    CollisionVector* m_pTriCompressedShadVectorArray; // offset 0x28
+    ```
+  </Accordion>
+
+  <Accordion title="CollisionFloat — compressed plane offsets">
+    `CollisionFloat` is a single `i16` used in `CColTrianglePlane` to store the plane's distance from the origin. `GetNormalOffset()` scales it back to `f32` by dividing by 128.0.
+
+    ```cpp
+    // func: sa 0x411D80
+    f32 CColTrianglePlane::GetNormalOffset() const
+    {
+        return m_compressedNormalOffset / 128.0f;
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="CColTrianglePlane — compressed normals">
+    `CColTrianglePlane` (0x0A bytes) stores the triangle's face normal as a `CollisionVector` and the plane offset as a `CollisionFloat`. The x, y, z components are scaled by 4096. A `m_nPrincipalAxis` byte (one of `COLTRIANGLE_AXIS_POSX`..`COLTRIANGLE_AXIS_NEGZ`) encodes the dominant normal direction for fast 2D projection during line–triangle tests.
+
+    ```cpp
+    f32 CColTrianglePlane::GetNormalX() const { return m_compressedNormal.x / 4096.0f; }
+    f32 CColTrianglePlane::GetNormalY() const { return m_compressedNormal.y / 4096.0f; }
+    f32 CColTrianglePlane::GetNormalZ() const { return m_compressedNormal.z / 4096.0f; }
+    ```
+
+    Plane normals are computed from the raw `CollisionVector` vertex pool by `CCollision::CalculateTrianglePlanes()` and removed by `CCollision::RemoveTrianglePlanes()` to reclaim the allocation when no longer needed.
+  </Accordion>
+</AccordionGroup>
+
+<Info>
+  Shadow triangle data follows the same compressed layout as primary triangles. `m_pTriCompressedShadVectorArray` and `m_pShadTriangleArray` in `CCollisionData` mirror the primary arrays and are only present when `m_hasShadowTris` is set.
+</Info>

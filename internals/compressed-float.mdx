@@ -1,0 +1,186 @@
+---
+title: "Compressed float and vector encoding internals"
+description: "Fixed-point integer types that store collision normals, translation offsets, and quaternion components at half the memory cost of 32-bit floats."
+---
+
+The collision system avoids storing raw `float` values wherever possible. Instead, scalar and vector quantities are packed into 16-bit or 8-bit integers using a fixed-point scheme chosen to match the precision requirements of each use case. This page explains every type, the encode/decode formulas, and why two separate precision tiers exist for normals versus translations.
+
+## Type definitions
+
+The core scalar types are selected at compile time. When `COMPRESSION_OFF` is defined (debug builds only), `CompressedFloat` falls back to `f32` so that compression and decompression round-trips become no-ops. In all shipping builds, the types resolve as follows.
+
+```cpp
+// Default (shipping): i16 / i8
+typedef i16  CompressedFloat;   // 16-bit signed — used for normals and quaternions
+typedef i8   CompressedFloat8;  // 8-bit signed  — used for translation vectors
+```
+
+Two aggregate types are built on top of `CompressedFloat`:
+
+```cpp
+struct CompressedVector
+{
+    CompressedFloat x;
+    CompressedFloat y;
+    CompressedFloat z;
+};
+
+struct CompressedQuat
+{
+    CompressedFloat x;
+    CompressedFloat y;
+    CompressedFloat z;
+    CompressedFloat w;
+};
+```
+
+The engine also exposes two convenience aliases used at call sites throughout the collision code:
+
+```cpp
+typedef CompressedVector CollisionVector;
+typedef CompressedFloat  CollisionFloat;
+```
+
+`CollisionVector` and `CollisionFloat` appear in `CColTrianglePlane` (where compressed normals are stored) and in serialized on-disk structs.
+
+## Normal float encoding (±7.0, 16-bit)
+
+Triangle plane normals, quaternion components, and similar unit-range values use a scale factor of 4096. This gives a representable range of **±7.0** with a step size of `1/4096 ≈ 0.000244`.
+
+```cpp
+#define COMPRESSED_NORMAL_FLOAT_MAX  (7.0f)
+#define COMPRESSED_NORMAL_FLOAT_MIN (-7.0f)
+
+inline CompressedFloat CompressNormalFloat(f32 f)
+{
+    return static_cast<CompressedFloat>(f * 4096.0f);
+}
+
+inline f32 DecompressNormalFloat(CompressedFloat i)
+{
+    return i * (1.0f / 4096.0f);
+}
+```
+
+<Note>
+A true unit normal has components in `[-1, 1]`, so the ±7.0 range provides a comfortable safety margin. The constants `COMPRESSED_NORMAL_FLOAT_MAX_STR` / `COMPRESSED_NORMAL_FLOAT_MIN_STR` are used in diagnostic messages only.
+</Note>
+
+## Translation float encoding (8-bit and 16-bit)
+
+Vertex positions and translation offsets use a different scale and a narrower integer type.
+
+### 8-bit (`CompressedFloat8`)
+
+The 8-bit path trades range for footprint. The scale factor is 8 on compression and 1/128 on decompression; the asymmetry arises because an `i8` carries values in `[-128, 127]`, so `128 × (1/128) = 1.0` and the reconstructed range is `[-1.0, ~0.992]`.
+
+```cpp
+inline CompressedFloat8 CompressTranslationFloat8(f32 f)
+{
+    return static_cast<CompressedFloat8>(f * 8.0f);
+}
+
+inline f32 DecompressTranslationFloat8(CompressedFloat8 i)
+{
+    return i * (1.0f / 128.0f);
+}
+```
+
+`CollisionVector` (which stores `CompressedFloat` — i.e. i16 — per component) is used as the carrier type, but the actual values written by the 8-bit path only use the lower byte of each field. The vector helpers compress and decompress all three components in one call:
+
+```cpp
+inline void CompressTranslationVector(CollisionVector& cv, const CVector& v)
+{
+    cv.x = CompressTranslationFloat8(v.x);
+    cv.y = CompressTranslationFloat8(v.y);
+    cv.z = CompressTranslationFloat8(v.z);
+}
+
+inline void DecompressTranslationVector(CVector& v, const CollisionVector& cv)
+{
+    v.x = DecompressTranslationFloat8(cv.x);
+    v.y = DecompressTranslationFloat8(cv.y);
+    v.z = DecompressTranslationFloat8(cv.z);
+}
+```
+
+### 16-bit (`CompressedFloat`)
+
+When a higher-precision translation is needed, the same 1/128 multiplier is applied but over the full 16-bit range, giving a representable range of ±256 at a step size of `1/128 ≈ 0.0078`.
+
+```cpp
+inline f32 DecompressTranslationFloat16(CompressedFloat i)
+{
+    return i * (1.0f / 128.0f);
+}
+
+inline void DecompressTranslationVector16(CVector& v, const CollisionVector& cv)
+{
+    v.x = DecompressTranslationFloat16(cv.x);
+    v.y = DecompressTranslationFloat16(cv.y);
+    v.z = DecompressTranslationFloat16(cv.z);
+}
+```
+
+<Info>
+There is no `CompressTranslationFloat16` — the 16-bit translation path is decode-only in this header. The assumption is that 16-bit translation values are produced by the offline collision compiler, not by runtime code.
+</Info>
+
+## Quaternion helpers
+
+Quaternion components are unit-range values and therefore use the normal float encoding (scale 4096). The helpers compress and decompress all four components atomically:
+
+```cpp
+inline void CompressQuaternion(CompressedQuat& cq, const QuaternionData& q)
+{
+    cq.x = CompressNormalFloat(q.v[0]);
+    cq.y = CompressNormalFloat(q.v[1]);
+    cq.z = CompressNormalFloat(q.v[2]);
+    cq.w = CompressNormalFloat(q.v[3]);
+}
+
+inline void DecompressQuaternion(QuaternionData& q, const CompressedQuat& cq)
+{
+    q.v[0] = DecompressNormalFloat(cq.x);
+    q.v[1] = DecompressNormalFloat(cq.y);
+    q.v[2] = DecompressNormalFloat(cq.z);
+    q.v[3] = DecompressNormalFloat(cq.w);
+}
+```
+
+## Memory savings
+
+A `CVector` holds three `f32` values — 12 bytes. A `CollisionVector` holds three `i16` (or `i8`) values — 6 bytes or 3 bytes. For triangle plane normals, where many thousands of vectors exist in `CCollisionData`, the 16-bit representation halves memory consumption:
+
+| Type | Storage per vector | Saving vs `CVector` |
+|---|---|---|
+| `CVector` (f32 × 3) | 12 bytes | — |
+| `CollisionVector` / `CompressedVector` (i16 × 3) | 6 bytes | 50 % |
+| 8-bit translation vector (i8 × 3 in i16 fields) | 6 bytes | 50 % |
+
+<Tip>
+The savings compound across an entire collision mesh. A model with 2 000 triangle plane normals uses 12 KB with `CompressedVector` versus 24 KB with raw `CVector` arrays.
+</Tip>
+
+## Precision comparison
+
+<AccordionGroup>
+  <Accordion title="Normal float (scale 4096)">
+    - **Range**: ±7.0
+    - **Step**: `1 / 4096 ≈ 0.000244`
+    - **Use cases**: triangle plane normals, quaternion components
+    - **Integer type**: `i16`
+  </Accordion>
+  <Accordion title="Translation float8 (scale 8 / 128)">
+    - **Range**: approximately ±16.0 (encode) / ±1.0 (effective usable)
+    - **Step**: `1 / 128 ≈ 0.0078`
+    - **Use cases**: compact vertex offsets, short-range translation vectors
+    - **Integer type**: `i8` (stored in `i16` field of `CollisionVector`)
+  </Accordion>
+  <Accordion title="Translation float16 (scale 128)">
+    - **Range**: ±256.0
+    - **Step**: `1 / 128 ≈ 0.0078`
+    - **Use cases**: wider-range translation vectors, plane normal offsets in `CColTrianglePlane`
+    - **Integer type**: `i16`
+  </Accordion>
+</AccordionGroup>

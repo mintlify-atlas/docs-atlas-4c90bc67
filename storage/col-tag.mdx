@@ -1,0 +1,130 @@
+---
+title: "ColTag: .col archive block header format structures"
+description: "ColTag and ColTag_lite are the binary block headers in GTA:SA .col archives. They identify the format version (COLL–COL4), payload size, and model name."
+---
+
+Every `.col` file in GTA:SA is a flat sequence of tagged blocks. Each block begins with a short header that declares the format version, the byte length of the payload that follows, and the name of the model the collision data belongs to. `ColTag` and `ColTag_lite` are the two C++ structs that map directly onto these headers, and the `COLLTYPE` enum identifies which of the four historical format versions a given block uses.
+
+## COLLTYPE enum
+
+The anonymous enum defines integer constants for the four collision format versions introduced across the GTA III-era games and carried through to San Andreas.
+
+```cpp
+enum
+{
+    COLLTYPE1, // 0 — GTA III / Vice City v1: spheres and boxes only
+    COLLTYPE2, // 1 — San Andreas v2: adds triangle meshes
+    COLLTYPE3, // 2 — San Andreas v3: adds shadow triangle meshes
+    COLLTYPE4, // 3 — San Andreas v4: adds disk primitives
+};
+```
+
+| Value | Constant | Tag string | Features |
+|---|---|---|---|
+| 0 | `COLLTYPE1` | `"COLL"` | Spheres, boxes, lines. No triangle mesh. |
+| 1 | `COLLTYPE2` | `"COL2"` | Adds full triangle meshes for solid geometry. |
+| 2 | `COLLTYPE3` | `"COL3"` | Adds a separate shadow triangle mesh. |
+| 3 | `COLLTYPE4` | `"COL4"` | Adds disk primitives for flat circular surfaces. |
+
+The loader reads the `tag` field of each block header and maps it to the appropriate `COLLTYPE` to select the correct deserialization path.
+
+## ColTag struct
+
+`ColTag` is the full block header, used when the loader needs both the format tag and the model name.
+
+```cpp
+struct ColTag
+{
+    char tag[4];    // Four-character format identifier: "COLL", "COL2", "COL3", or "COL4"
+    i32  size;      // Byte length of the collision data payload following this header
+    char name[24];  // Null-terminated name of the associated model (up to 23 chars + NUL)
+};
+CHECK_SIZE_X86(ColTag, 0x20);
+```
+
+<Note>
+`size` counts only the payload bytes after the `ColTag` header itself. To seek to the next block, advance the file cursor by `sizeof(ColTag) + size`.
+</Note>
+
+### Fields
+
+**`tag[4]`** — The four-character code identifying the collision format version. The loader performs a four-byte comparison against the known tag strings (`"COLL"`, `"COL2"`, `"COL3"`, `"COL4"`) to select the parsing branch. The field is not null-terminated; all four bytes are always used.
+
+**`size`** — A signed 32-bit integer holding the byte length of the data block that immediately follows the header. This allows a reader to skip over unknown or unwanted blocks without parsing their contents.
+
+**`name[24]`** — A null-terminated character array giving the model name associated with this collision block. This name corresponds to a `ColDef::name` entry in `CColStore`, linking the raw binary block to its slot in the streaming system.
+
+## ColTag_lite struct
+
+`ColTag_lite` is the lightweight variant used when the loader only needs to identify the format version and measure the block size — for example, when scanning a file to build bounding boxes without loading geometry.
+
+```cpp
+struct ColTag_lite
+{
+    char tag[4]; // Four-character format identifier
+    i32  size;   // Byte length of the collision data payload
+};
+CHECK_SIZE_X86(ColTag_lite, 0x8);
+```
+
+`ColTag_lite` occupies the same first 8 bytes as `ColTag`, so a reader can cast any block header pointer to `ColTag_lite*` to get the tag and size without reading the name field. `CColStore::LoadAllBoundingBoxes` uses this pattern to scan every block in a file at minimal cost.
+
+## .col file layout
+
+A `.col` archive is a contiguous stream of blocks with no top-level file header. Each block is self-contained and self-describing.
+
+```
+┌─────────────────────────────────────────────────────┐
+│ Block 0                                             │
+│  ColTag { tag="COL2", size=N0, name="vehicle_bus" } │
+│  [N0 bytes of COL2 collision data]                  │
+├─────────────────────────────────────────────────────┤
+│ Block 1                                             │
+│  ColTag { tag="COL3", size=N1, name="building_ls1" }│
+│  [N1 bytes of COL3 collision data]                  │
+├─────────────────────────────────────────────────────┤
+│  ... more blocks ...                                │
+└─────────────────────────────────────────────────────┘
+```
+
+To iterate all blocks in a file:
+
+```cpp
+u8* pCursor = pFileBuffer;
+u8* pEnd    = pFileBuffer + fileSize;
+
+while (pCursor < pEnd)
+{
+    ColTag* pHeader = reinterpret_cast<ColTag*>(pCursor);
+
+    // Determine format version from the tag
+    if (memcmp(pHeader->tag, "COLL", 4) == 0)
+        ParseColltype1(pCursor + sizeof(ColTag), pHeader->size, pHeader->name);
+    else if (memcmp(pHeader->tag, "COL2", 4) == 0)
+        ParseColltype2(pCursor + sizeof(ColTag), pHeader->size, pHeader->name);
+    else if (memcmp(pHeader->tag, "COL3", 4) == 0)
+        ParseColltype3(pCursor + sizeof(ColTag), pHeader->size, pHeader->name);
+    else if (memcmp(pHeader->tag, "COL4", 4) == 0)
+        ParseColltype4(pCursor + sizeof(ColTag), pHeader->size, pHeader->name);
+
+    // Advance past this block
+    pCursor += sizeof(ColTag) + pHeader->size;
+}
+```
+
+## Version history
+
+<AccordionGroup>
+  <Accordion title="COLLTYPE1 — COLL (GTA III / Vice City)">
+    The original format. Supports sphere primitives, axis-aligned box primitives, and line segments. No triangle mesh is present. All surface normals are implicit from the primitive geometry. San Andreas retains COLL support for backwards-compatible assets imported from earlier titles.
+  </Accordion>
+  <Accordion title="COLLTYPE2 — COL2 (San Andreas v2)">
+    Introduced a full triangle mesh for solid collision geometry. Triangle normals are stored in a compressed fixed-point format. This is the most common format in the San Andreas shipped data.
+  </Accordion>
+  <Accordion title="COLLTYPE3 — COL3 (San Andreas v3)">
+    Extended COL2 with a separate shadow triangle mesh. The shadow mesh is lower-resolution than the collision mesh and is used exclusively for shadow casting calculations, reducing the cost of shadow queries.
+  </Accordion>
+  <Accordion title="COLLTYPE4 — COL4 (San Andreas v4)">
+    Added disk primitives — flat circular volumes useful for manhole covers, road markings, and similar flat surfaces that are poorly approximated by boxes or spheres.
+  </Accordion>
+</AccordionGroup>

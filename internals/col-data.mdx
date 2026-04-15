@@ -1,0 +1,113 @@
+---
+title: "ColData: surface type, piece type, and lighting byte"
+description: "Three-byte struct embedded in CColSphere and CColBox. Stores the surface material ID, eColPieceType hit identifier, and a packed day/night lighting nibble pair."
+---
+
+Every collidable primitive in the system — `CColSphere`, `CColBox`, and `CColTriangle` — embeds a `ColData` struct. Despite occupying only three bytes, it encodes all the metadata the engine needs to determine audio response, physics friction, which part of a model was struck, and how brightly a surface appears at any time of day.
+
+## Struct definition
+
+```cpp
+struct ColData
+{
+    u8 m_nSurfaceType;  // surface material (audio, friction, effects)
+    u8 m_nPieceType;    // which part of the entity was hit
+    u8 m_lighting;      // packed day/night light value
+};
+CHECK_SIZE_X86(ColData, 0x3);
+```
+
+The `CHECK_SIZE_X86` assertion guarantees the struct is exactly 3 bytes on x86 with no compiler-inserted padding.
+
+## Fields
+
+### `m_nSurfaceType`
+
+This byte identifies the physical material of the surface. The engine uses it to:
+
+- Select the correct tyre screech, footstep, and impact sound effects.
+- Apply the appropriate friction coefficient during sliding and rolling physics.
+- Trigger particle effects (sparks on metal, dust on dirt, splashes on water).
+
+Values map to an internal surface material enum (e.g. concrete, grass, gravel, metal, sand, water). The full enum is defined in the surface info subsystem rather than in the collision headers.
+
+### `m_nPieceType`
+
+This byte identifies which logical part of the entity was struck. The engine uses it to determine hit reactions — for example, whether a wheel, door, or chassis of a vehicle was involved. The values come from `eColPieceType`, defined in `col_point.hpp`.
+
+Common piece type values include:
+
+| Value | Constant | Meaning |
+|---|---|---|
+| `0` | `COLPOINT_PIECETYPE_DEFAULT` | Generic — no specific part |
+| `1` | `COLPOINT_PIECETYPE_BONNET` | Vehicle hood / bonnet |
+| `3` | `COLPOINT_PIECETYPE_FRONTBUMPER` | Front bumper |
+| `5` | `COLPOINT_PIECETYPE_FRONTLEFTDOOR` | Front-left door |
+| `13` | `COLPOINT_PIECETYPE_FRONTLEFTWHEEL` | Front-left wheel |
+| `20` | `COLPOINT_PIECETYPE_PED_SPHERE_LEG` | Pedestrian leg sphere |
+
+<Info>
+`m_nPieceType` in `ColData` stores the outgoing annotation on the primitive. The `CColPoint` structure that is produced at collision time carries the same field, populated by copying `m_nPieceType` from whichever primitive was hit.
+</Info>
+
+### `m_lighting`
+
+The lighting byte packs two independent 4-bit values into a single byte: a **day** intensity in the lower nibble and a **night** intensity in the upper nibble.
+
+```text
+ 7   6   5   4   3   2   1   0
+[  night (0–15)  |   day (0–15)  ]
+```
+
+To read the two components:
+
+```cpp
+u8 light = colData.m_lighting;
+
+i32 day   = light & 0xF;          // lower nibble
+i32 night = (light >> 4) & 0xF;   // upper nibble
+```
+
+The same encoding is used by `CColTriangle::m_nLighting`.
+
+## Lighting calculation
+
+`CColTriangle::CalculateLighting` shows how the packed byte is consumed at runtime to produce a single brightness scalar that is blended between day and night based on the current time of day:
+
+```cpp
+// func: sa 0x59F0C0
+f32 CColTriangle::CalculateLighting(u8 light, f32 Scale)
+{
+    i32 day   = light & 0xF;
+    i32 night = (light >> 4) & 0xF;
+
+    f32 fDay   = static_cast<f32>(day)   * Scale / 15.0f;
+    f32 fNight = static_cast<f32>(night) * Scale / 15.0f;
+
+    f32 dnBalance = cbrGetDayNightBalanceParam(); // 0.0 = full day, 1.0 = full night
+
+    return fDay * (1.0f - dnBalance) + (fNight * dnBalance);
+}
+```
+
+Each nibble is divided by 15 (the maximum nibble value) to normalise it to `[0, 1]`, then multiplied by `Scale` to fit the target brightness range. The `dnBalance` parameter linearly interpolates between the two results, so a surface always reflects the correct ambient intensity at any hour.
+
+<Note>
+A value of `0xF0` means maximum night brightness and zero day brightness; `0x0F` is the inverse. A fully lit surface at all times would be `0xFF`.
+</Note>
+
+## Embedded usage
+
+`ColData` is always embedded by value — never heap-allocated independently. The three primitive types that carry it are:
+
+<AccordionGroup>
+  <Accordion title="CColSphere">
+    `CColSphere` stores a `ColData` alongside its centre position and radius. The surface type governs how a sphere-bounded vehicle or object sounds and behaves on impact.
+  </Accordion>
+  <Accordion title="CColBox">
+    `CColBox` stores a `ColData` alongside its minimum and maximum corner vectors. Box primitives are common for building interiors and rectangular props.
+  </Accordion>
+  <Accordion title="CColTriangle">
+    `CColTriangle` mirrors the two relevant bytes from `ColData` directly as `m_nSurfaceType` and `m_nLighting` fields, avoiding a nested struct for memory layout reasons. The piece type is inherited from the owning model rather than stored per-triangle.
+  </Accordion>
+</AccordionGroup>

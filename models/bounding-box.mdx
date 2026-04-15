@@ -1,0 +1,156 @@
+---
+title: "CBoundingBox and CColModelSection — broad-phase bounds"
+description: "CBoundingBox holds the bounding sphere and AABB for broad-phase rejection in CColModel. CColModelSection subdivides a triangle list for per-section culling."
+---
+
+Before the engine tests any individual primitive, it performs two cheap broad-phase rejection tests: a bounding sphere check followed by a bounding box check. `CBoundingBox` encapsulates both bounds and exposes them to `CColModel` through inheritance. `CColModelSection` carries a per-section bounding box and an index range into the triangle list, enabling finer-grained culling within a single large mesh.
+
+## CBoundingBox
+
+```cpp
+class CBoundingBox
+{
+public:
+    CBoundingBox();
+
+    // Bounding sphere
+    const CSphere& GetBoundSphere() const;
+    CSphere&       GetBoundSphere();
+    void  SetBoundRadius(f32 r);
+    f32   GetBoundRadius() const;
+    void  SetBoundOffset(const CVector& v);
+    const CVector& GetBoundOffset() const;
+
+    // Bounding box
+    const CBox&    GetBoundBox()    const;
+    CBox&          GetBoundBox();
+    const CVector& GetBoundBoxMin() const;
+    const CVector& GetBoundBoxMax() const;
+    void SetBoundBoxMin(const CVector& vec);
+    void SetBoundBoxMax(const CVector& vec);
+    void SetBoundBoxMinZ(f32 fMinZ);
+    void SetBoundBoxMaxZ(f32 fMaxZ);
+
+private:
+    CBox    m_boxBound;     // 0x00 — 0x18 bytes
+    CSphere m_sphereBound;  // 0x18 — 0x10 bytes
+};
+CHECK_SIZE_X86(CBoundingBox, 0x28);
+```
+
+### Internal fields
+
+<ResponseField name="m_boxBound" type="CBox">
+  An axis-aligned bounding box stored as two `CVector` values (`m_vecMin` and `m_vecMax`). `CBox` is 0x18 bytes. The default constructor initialises `m_vecMin = (1, 1, 1)` and `m_vecMax = (-1, -1, -1)` — an inside-out box — so any subsequent `SetBoundBoxMin`/`SetBoundBoxMax` pair produces a valid non-empty box regardless of call order.
+</ResponseField>
+
+<ResponseField name="m_sphereBound" type="CSphere">
+  A bounding sphere stored as `CVector m_vecCentre` plus `f32 m_fRadius` (0x10 bytes total). `SetBoundOffset` writes the centre; `SetBoundRadius` writes the radius. The sphere's centre is expressed in model-local space and is often the same as the geometric centroid.
+</ResponseField>
+
+### Bounding sphere API
+
+```cpp
+void  SetBoundRadius(f32 r);
+f32   GetBoundRadius() const;
+
+// Centre of the bounding sphere in model space.
+void  SetBoundOffset(const CVector& v);
+const CVector& GetBoundOffset() const;
+```
+
+The bounding sphere is tested first in the collision pipeline because a sphere–sphere or sphere–AABB overlap test requires fewer operations than an AABB–AABB test. Only if the sphere overlaps does the engine proceed to the bounding box check.
+
+### Bounding box API
+
+```cpp
+const CVector& GetBoundBoxMin() const;  // m_boxBound.m_vecMin
+const CVector& GetBoundBoxMax() const;  // m_boxBound.m_vecMax
+void SetBoundBoxMin(const CVector& vec);
+void SetBoundBoxMax(const CVector& vec);
+void SetBoundBoxMinZ(f32 fMinZ);
+void SetBoundBoxMaxZ(f32 fMaxZ);
+```
+
+The partial setters `SetBoundBoxMinZ` and `SetBoundBoxMaxZ` are provided because vehicle and pedestrian code frequently adjusts only the vertical extent of a model's bounds without rebuilding the full XY footprint.
+
+### Broad-phase culling order
+
+The collision pipeline uses bounds in this order:
+
+<Steps>
+  <Step title="Bounding sphere">
+    The engine computes the distance between the two models' sphere centres and compares it to the sum of their radii. If the spheres do not overlap, the pair is rejected immediately.
+  </Step>
+  <Step title="Bounding box">
+    If the spheres overlap, the engine tests the AABBs. This eliminates cases where the spheres touch but the actual geometry is on opposite sides.
+  </Step>
+  <Step title="Individual primitives">
+    Only pairs that pass both broad-phase tests proceed to narrow-phase testing against each sphere, box, line, and triangle in the `CCollisionData`.
+  </Step>
+</Steps>
+
+### Example: setting bounds after manual allocation
+
+```cpp
+CColModel* pModel = new CColModel();
+pModel->AllocateData(1, 0, 0, 0, 0); // one sphere, nothing else
+
+// After populating the sphere, set matching bounds.
+pModel->SetBoundRadius(2.0f);
+pModel->SetBoundOffset(CVector(0.0f, 0.0f, 1.0f)); // sphere centre in model space
+
+pModel->SetBoundBoxMin(CVector(-2.0f, -2.0f, -1.0f));
+pModel->SetBoundBoxMax(CVector( 2.0f,  2.0f,  3.0f));
+```
+
+<Warning>
+  If `m_boxBound.m_vecMin` is greater than `m_boxBound.m_vecMax` on any axis (the default inside-out state), every broad-phase AABB test will reject the model. Always set both min and max before attaching a `CColModel` to a live entity.
+</Warning>
+
+## CColModelSection
+
+`CColModelSection` is a lightweight spatial subdivision entry used when `CCollisionData::m_useColModelSections` is set. It stores a bounding box around a contiguous range of triangles so the engine can skip entire triangle groups without testing each one individually.
+
+```cpp
+struct CColModelSection
+{
+    CBox bb;          // bounding box of the section
+    i16  startIndex;  // first triangle index in the range
+    i16  endIndex;    // last triangle index in the range (inclusive)
+};
+CHECK_SIZE_X86(CColModelSection, 0x1C);
+```
+
+### Fields
+
+<ResponseField name="bb" type="CBox">
+  Bounding box (`m_vecMin`, `m_vecMax`) that encloses all triangles in `[startIndex, endIndex]`. The engine tests this box before iterating over triangles in the range.
+</ResponseField>
+
+<ResponseField name="startIndex" type="i16">
+  Index of the first triangle in `CCollisionData::m_pTriangleArray` covered by this section.
+</ResponseField>
+
+<ResponseField name="endIndex" type="i16">
+  Index of the last triangle (inclusive) covered by this section.
+</ResponseField>
+
+### Memory layout
+
+Section entries are stored **before** the triangle array in memory, not in a separate heap allocation. Working backwards from `m_pTriangleArray`:
+
+```
+offset -4                      : u32 section count
+offset -4 - 1×0x1C            : CColModelSection[0]
+offset -4 - 2×0x1C            : CColModelSection[1]
+...
+offset -4 - (n+1)×0x1C        : CColModelSection[n-1]
+offset  0                      : CColTriangle[0]  ← m_pTriangleArray
+```
+
+This layout places both the section metadata and the triangle data inside the same allocation, avoiding an extra pointer chase at query time. See `CCollisionData::GetNoOfColModelSections()` and `CCollisionData::GetColModelSection(i)` for the accessor implementation.
+
+<Note>
+  `CColModelSection` is a WDMOBILE-specific feature. On PC/console builds `m_useColModelSections` is always `false` and these entries are never present. Do not access section data without checking the flag first.
+</Note>

@@ -1,0 +1,288 @@
+---
+title: "CPhysical: the physically simulated entity base class"
+description: "Complete reference for CPhysical — adds mass, velocity, friction, collision response, spring suspension, entity attachment, and damage records to CEntity."
+---
+
+`CPhysical` extends `CEntity` with the full set of properties and methods needed for Newtonian simulation: mass, rotational inertia, linear and angular velocity, friction, elasticity, buoyancy, and force application. Every vehicle, pedestrian, and dynamic object in the game is a `CPhysical`. The class occupies exactly **0x138 bytes** on x86.
+
+```cpp
+// vtable: sa 0x863BA0
+class CPhysical : public CEntity { ... };
+CHECK_SIZE_X86(CPhysical, 0x138);
+```
+
+## CPhysicalFlags
+
+A packed 32-bit bit field embedded in every `CPhysical` instance at `m_nPhysicalFlags`. Each flag occupies exactly one bit; the field can be cleared atomically with `Clear()`.
+
+```cpp
+struct CPhysicalFlags
+{
+    void Clear() { *reinterpret_cast<u32*>(this) = 0; }
+    ...
+};
+```
+
+### Bits 0–7 — physics mode
+
+| Bit | Mask | Flag | Description |
+|-----|------|------|-------------|
+| 0 | `0x00000001` | `bExtraHeavy` | Object has extra mass (resists being pushed). |
+| 1 | `0x00000002` | `bDoGravity` | Gravity is applied every frame. |
+| 2 | `0x00000004` | `bInfiniteMass` | Object cannot be moved by collisions. |
+| 3 | `0x00000008` | `bInfiniteMassFixed` | Fixed infinite-mass variant (also blocks rotation). |
+| 4 | `0x00000010` | `bPedPhysics` | Uses pedestrian-specific physics integrator. |
+| 5 | `0x00000020` | `bDoorPhysics` | Door-hinge physics active. |
+| 6 | `0x00000040` | `bHangingPhysics` | Object hangs from an attachment point (e.g. crane payload). |
+| 7 | `0x00000080` | `bPoolBallPhysics` | Pool-ball rolling simulation enabled. |
+
+### Bits 8–15 — state flags
+
+| Bit | Mask | Flag | Description |
+|-----|------|------|-------------|
+| 8  | `0x00000100` | `bIsInWater` | Object is currently floating in water. |
+| 9  | `0x00000200` | `bCollidedThisFrame` | Set when a collision was detected this frame; cleared at the start of the next. |
+| 10 | `0x00000400` | `bUnFreezable` | Script cannot freeze this object's coordinates. |
+| 11 | `0x00000800` | `bTrainForceCol` | Forces collision even when riding on a train. |
+| 12 | `0x00001000` | `bSkipLineCol` | Skips the line-segment collision pass. |
+| 13 | `0x00002000` | `bCoorsFrozenByScript` | Coordinates have been locked by a script command. |
+| 14 | `0x00004000` | `bDontLoadCollision` | Suppresses streaming of collision data for this entity. |
+| 15 | `0x00008000` | `bHalfSpeedCollision` | Collision is evaluated at half the normal impulse scale. |
+
+### Bits 16–23 — damage immunity
+
+| Bit | Mask | Flag | Description |
+|-----|------|------|-------------|
+| 16 | `0x00010000` | `bForceHitReturnFalse` | Makes `ApplyCollision` always return `false` regardless of actual impact. |
+| 17 | `0x00020000` | `bDontProcessCollisionOurSelves` | Skips self-collision processing (delegate to partner entity). |
+| 18 | `0x00040000` | `bNotDamagedByBullets` | Object is bulletproof. |
+| 19 | `0x00080000` | `bNotDamagedByFlames` | Object is fireproof. |
+| 20 | `0x00100000` | `bNotDamagedByCollisions` | Object is collision-proof. |
+| 21 | `0x00200000` | `bNotDamagedByMelee` | Object is immune to melee weapon damage. |
+| 22 | `0x00400000` | `bOnlyDamagedByPlayer` | Only the player can damage this object. |
+| 23 | `0x00800000` | `bIgnoresExplosions` | Explosion forces and damage are ignored. |
+
+### Bits 24–31 — advanced behaviour
+
+| Bit | Mask | Flag | Description |
+|-----|------|------|-------------|
+| 24 | `0x01000000` | `bFlyer` | Object is airborne (plane or helicopter). |
+| 25 | `0x02000000` | `bNeverGoStatic` | Object never transitions to the static sleep state. |
+| 26 | `0x04000000` | `bUsingSpecialColModel` | A non-default collision model is active (e.g. damage state). |
+| 27 | `0x08000000` | `bForceFullWaterCheck` | Always runs the full water-depth check, not the optimised version. |
+| 28 | `0x10000000` | `bUsesCollisionRecords` | Collision partner list is maintained (see `AddCollisionRecord`). |
+| 29 | `0x20000000` | `bRenderScorched` | Object is destroyed; renderer applies a black scorched shader. |
+| 30 | `0x40000000` | `bDoorHitEndStop` | Door has reached its travel limit and should stop. |
+| 31 | `0x80000000` | `bCarriedByRope` | Object is attached to a crane rope. |
+
+## Physics properties
+
+```cpp
+f32 m_fMass;
+f32 m_fTurnMass;
+f32 m_fMassMultiplier;
+f32 m_fAirResistance;
+f32 m_fElasticity;
+f32 m_fBuoyancyConstant;
+CVector m_vecCOM;  // centre of mass offset in model space
+```
+
+Each property has a symmetric getter/setter pair:
+
+```cpp
+void SetMass(f32 fMass);            f32 GetMass();
+void SetTurnMass(f32 fTurnMass);    f32 GetTurnMass();
+void SetAirResistance(f32 v);       f32 GetAirResistance();
+void SetElasticity(f32 v);          f32 GetElasticity();
+void SetBuoyancyConstant(f32 v);    f32 GetBuoyancyConstant();
+void SetCentreOfMass(const CVector& vec);
+void SetCentreOfMass(f32 x, f32 y, f32 z);
+```
+
+The gravity constant applied each frame is defined as:
+
+```cpp
+// 1/125, but the exact value is game-specific
+// var: sa 0x863984
+#define PHYSICAL_GRAVITYFORCE (0.008f)
+```
+
+## Velocity
+
+Linear and angular velocity are stored separately. Both can be read and written per-axis or as a vector.
+
+```cpp
+const CVector& GetMoveSpeed() const;
+void SetMoveSpeed(const CVector& vecMoveSpeed);
+void SetMoveSpeed(f32 x, f32 y, f32 z);
+
+const CVector& GetTurnSpeed() const;
+void SetTurnSpeed(const CVector& vecTurnSpeed);
+void SetTurnSpeed(f32 x, f32 y, f32 z);
+
+// Returns the total velocity (linear + angular contribution) at a point
+// offset from the centre of mass.
+CVector GetSpeed(CVector vecOffset);
+```
+
+`GetSpeed(vecOffset)` combines linear and angular velocity at an arbitrary attachment point — useful when computing the velocity of a vehicle's wheel hub or a weapon's muzzle.
+
+## Force application
+
+```cpp
+void ApplyMoveForce(CVector vecForce);
+void ApplyMoveForce(f32 xd, f32 yd, f32 zd);
+
+void ApplyTurnForce(CVector vecForce, CVector vecOffset);
+void ApplyTurnForce(f32 forceX, f32 forceY, f32 forceZ,
+                    f32 offsetX, f32 offsetY, f32 offsetZ);
+
+// Applies both linear and angular impulse in one call.
+// bValidTorque: if false, the torque (turn) component is skipped.
+void ApplyForce(CVector vecForce, CVector vecOffset, bool bValidTorque);
+```
+
+<Note>
+All force vectors are in **world space**. The offset passed to `ApplyTurnForce` is also in world space (relative to the entity's origin, not its centre of mass). The engine internally subtracts `m_vecCOM` when computing the torque arm.
+</Note>
+
+## Friction
+
+Friction forces are accumulated separately from the main velocity so they can be clamped before integration.
+
+```cpp
+void ApplyFrictionMoveForce(CVector vecForce);
+void ApplyFrictionMoveForce(f32 x, f32 y, f32 z);
+
+void ApplyFrictionTurnForce(CVector vecForce, CVector vecOffset);
+void ApplyFrictionTurnForce(f32 fx, f32 fy, f32 fz,
+                             f32 ox, f32 oy, f32 oz);
+
+void ApplyFrictionForce(CVector vecForce, CVector vecOffset);
+void ApplyFrictionForce(f32 fx, f32 fy, f32 fz,
+                         f32 ox, f32 oy, f32 oz);
+
+// High-level friction application given an adhesion limit and contact point.
+bool ApplyFriction(f32 fAdhesiveLimit, CColPoint& colPoint);
+
+// Two-body variant: applies equal-and-opposite friction to a second physical.
+bool ApplyFriction(CPhysical* pPhysical, f32 fAdhesiveLimit, CColPoint& colPoint);
+```
+
+## Collision detection and response
+
+```cpp
+bool CheckCollision();
+bool CheckCollision_SimpleCar();
+```
+
+`CheckCollision` runs the full narrow-phase pipeline for this entity against the world. `CheckCollision_SimpleCar` is an optimised path for simple vehicle types that skips expensive pedestrian and object checks.
+
+### ApplyCollision
+
+```cpp
+// Entity overload: entity is static; only this physical receives an impulse.
+bool ApplyCollision(CEntity* pEntity, CColPoint& colPoint, f32& fImpulseMagnitude);
+
+// Physical overload: both objects receive equal-and-opposite impulses.
+bool ApplyCollision(CPhysical* pPhysical, CColPoint& colPoint,
+                    f32& fImpulseMagnitudeA, f32& fImpulseMagnitudeB);
+```
+
+### ApplyCollisionAlt and ApplySoftCollision
+
+```cpp
+bool ApplyCollisionAlt(
+    CEntity* pEntity, CColPoint& colPoint,
+    f32& fImpulseMagnitude, CVector& vecMoveInc, CVector& vecTurnInc);
+
+bool ApplySoftCollision(
+    CEntity* pEntity, CColPoint& colPoint, f32& fImpulseMagnitude);
+
+bool ApplySoftCollision(
+    CPhysical* pPhysical, CColPoint& colPoint,
+    f32& fImpulseMagnitudeA, f32& fImpulseMagnitudeB);
+```
+
+`ApplyCollisionAlt` returns the incremental linear and angular velocity deltas rather than applying them immediately, so the caller can accumulate multiple contacts before committing. `ApplySoftCollision` applies a damped response — used for slow-speed nudges that should not produce a loud collision sound.
+
+## Spring suspension
+
+Spring functions model vehicle suspension, crane cables, and similar elastic constraints.
+
+```cpp
+bool ApplySpringCollision(
+    f32 fSpringStrength, CVector& vecDirection, CVector& vecOffset,
+    f32 fCompressionRatio, f32 fSuspensionBias, f32& fImpulseMagnitude);
+
+bool ApplySpringCollisionAlt(
+    f32 fSpringStrength, CVector& vecDirection, CVector& vecOffset,
+    f32 fCompressionRatio, f32 fSuspensionBias,
+    CVector& vecColNormal, f32& fImpulseMagnitude);
+
+bool ApplySpringDampening(
+    f32 fDampeningScalar, f32 fSpringForce,
+    CVector& vecDirection, CVector& vecOffset, CVector& vecSpeed);
+
+bool ApplySpringDampeningOld(
+    f32 fDampeningScalar, f32 fSpringForce,
+    CVector& vecDirection, CVector& vecOffset, CVector& vecSpeed);
+```
+
+`ApplySpringCollision` computes the spring restoring force from `fCompressionRatio` and `fSuspensionBias` and applies it at `vecOffset`. The `Alt` variant also accepts the contact surface normal for more accurate torque computation. `ApplySpringDampening` adds velocity-proportional damping; `ApplySpringDampeningOld` is the legacy formulation retained for compatibility.
+
+## Entity attachment
+
+```cpp
+CEntity* AttachEntityToEntity(CEntity* pEnt, CVector vecPos, CVector vecTilt);
+CEntity* AttachEntityToEntity(CEntity* pEnt, CVector* pVecPos, RtQuat* pQuat);
+
+void DettachEntityFromEntity(f32 height, f32 direction, f32 strength, bool bMakeSpin);
+void DettachAutoAttachedEntity();
+void PositionAttachedEntity();
+```
+
+The first `AttachEntityToEntity` overload takes Euler-style tilt angles; the second takes a quaternion for arbitrary orientation. `DettachEntityFromEntity` launches the attached entity with a specified ejection speed and optionally imparts spin. `PositionAttachedEntity` repositions the attached entity to follow this physical each frame without re-attaching.
+
+## Sector processing
+
+```cpp
+bool ProcessCollisionSectorList(i32 x, i32 y);
+bool ProcessShiftSectorList(i32 x, i32 y);
+bool ProcessCollisionSectorList_SimpleCar(CRepeatSector* pSectorList);
+```
+
+These methods iterate the repeat-sector grid around world tile `(x, y)`, running collision checks against every entity in each sector. `ProcessShiftSectorList` handles the special-case shift (push-out) pass that resolves interpenetration without applying an impulse.
+
+## Collision records
+
+The damage record system tracks which entities this physical has collided with in the current frame, used for deduplication and damage attribution.
+
+```cpp
+void AddCollisionRecord(CEntity* pEntity);
+bool GetHasCollidedWith(CEntity* pEntity);
+bool GetHasCollidedWithAnyObject();
+void FlushCollisionRecords();   // sets m_nNoOfCollisionRecords = 0
+```
+
+Up to **6** collision partners are stored in `m_aCollisionRecordPtrs[6]`. Records are flushed at the start of each physics frame via `FlushCollisionRecords()`. The `bUsesCollisionRecords` flag must be set for `AddCollisionRecord` to write entries.
+
+## Lighting
+
+```cpp
+f32 GetLightingFromCol(bool bLightForRender) const;
+f32 GetLightingTotal() const;
+```
+
+`GetLightingFromCol` returns `m_lightingFromCollision`, scaled for either gameplay or rendering depending on `bLightForRender`. `GetLightingTotal` sums the collision lighting and the point-light contribution for use by the renderer.
+
+## Other methods
+
+```cpp
+void SkipPhysics();
+void UnsetIsInSafePosition();
+f32  GetDistanceTravelled();      // returns m_fTrueDistanceTravelled
+void RemoveRefsToEntity(CEntity* pEntity);
+```
+
+`SkipPhysics` fast-forwards the physics state without running the full integrator — used for entities that move by script rather than simulation. `UnsetIsInSafePosition` clears the safe-position flag so that the next frame triggers a new safe-position search. `RemoveRefsToEntity` scrubs `pEntity` from the collision record list and the attachment slot.

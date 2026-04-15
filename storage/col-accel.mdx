@@ -1,0 +1,188 @@
+---
+title: "CColAccel: binary cache for collision and IPL data"
+description: "CColAccel records CColModel bounds and IPL entity lists during a first-load pass, then replays the binary cache to skip redundant parsing on subsequent loads."
+---
+
+`CColAccel` is a static acceleration class that builds and replays a binary collision cache. On a first load it records every `CColModel` and every IPL entity list it processes; on subsequent loads it replays that cache instead of re-parsing raw `.col` and `.ipl` data. This removes redundant decompression and geometry reconstruction work during level streaming.
+
+## Data structures
+
+### CColAccelItem
+
+Represents one cached collision model entry. Stores the spatial bounds and model index so that the cache can quickly determine which models are relevant for a given area without loading full geometry.
+
+```cpp
+struct CColAccelItem
+{
+    CBoundingBox m_bounds;          // World-space AABB of the collision model
+    i32          m_iModelIndex;     // Model index this item belongs to
+    u16          m_level         : 8; // LOD level (0 = full detail)
+    u16          m_hasCollisionVols : 8; // Non-zero if geometry volumes are present
+};
+```
+
+The two bitfields are packed into a single `u16`, keeping the struct compact for cache-line efficiency when iterating large item arrays.
+
+### CIplAccelItem
+
+Represents one cached IPL (Item Placement List) entity. Records both the entity and its LOD counterpart, along with a bitmask of actions applied during caching.
+
+```cpp
+struct CIplAccelItem
+{
+    i32 m_iIndex;         // IPL instance index
+    i32 m_iLodIndex;      // Corresponding LOD instance index
+    i32 m_iModelIndex;    // Model used by this instance
+    i32 m_iLodModelIndex; // Model used by the LOD instance
+    i32 m_iActions;       // Bitmask of processing actions applied
+};
+CHECK_SIZE_X86(CIplAccelItem, 0x14);
+```
+
+### CColDefAccelItem
+
+A stripped-down version of `ColDef` used inside the cache. It omits the name, ref-count, and load-state fields that are managed at runtime by `CColStore`.
+
+```cpp
+struct CColDefAccelItem
+{
+    CRect bb;            // World-space bounding rectangle
+    i16   firstModel;    // First model index covered
+    i16   lastModel;     // Last model index covered
+    bool  inMemoryAlways; // Must never be evicted
+    bool  interior;      // Interior collision file
+};
+```
+
+## CacheState enum
+
+The state machine controlling the cache lifecycle uses three states.
+
+```cpp
+enum CacheState
+{
+    STATE_NONE,    // No cache operation in progress
+    STATE_SAVING,  // Cache is being built (startCache → endCache)
+    STATE_LOADING, // Cache is being replayed (cacheLoadCol)
+};
+```
+
+| State | Meaning |
+|---|---|
+| `STATE_NONE` | Idle. No cache I/O is happening. |
+| `STATE_SAVING` | Between `startCache()` and `endCache()`. Calls to `addCacheCol` and `cacheIPLSection` accumulate data. |
+| `STATE_LOADING` | `cacheLoadCol()` is replaying a previously written cache file. |
+
+## Constants
+
+```cpp
+enum { MAX_IPLDEFS = 256 };
+```
+
+The maximum number of `IplDef` entries that can be stored in the cache in a single session. IPL definitions beyond this limit are not cached.
+
+## Protected fields
+
+These fields are shared across all `CColAccel` methods and persist for the duration of a cache operation.
+
+| Field | Type | Description |
+|---|---|---|
+| `m_iCacheState` | `CColAccel::CacheState` | Current state of the cache machine |
+| `mp_cCacheName` | `char*` | Path to the cache file on disk |
+| `mp_caccColItems` | `CColAccelItem*` | Array of cached collision model entries |
+| `m_iNumColItems` | `i32` | Number of entries in `mp_caccColItems` |
+| `m_iCachingColSize` | `i32` | Total byte size allocated for the col items array |
+| `mp_caccIPLItems` | `CIplAccelItem*` | Array of cached IPL entity entries |
+| `m_iNumIPLItems` | `i32` | Number of entries in `mp_caccIPLItems` |
+| `m_iCachingIPLSize` | `i32` | Total byte size allocated for the IPL items array |
+| `m_iSectionSize` | `i32*` | Per-section byte counts for the IPL item blocks |
+| `m_iNumSections` | `i32` | Number of IPL sections recorded |
+| `m_iplDefs` | `IplDef*` | Up to `MAX_IPLDEFS` IPL definition records |
+| `m_colBounds` | `CColDefAccelItem*` | Cached bounding information for each col slot |
+| `m_iNumColBounds` | `i32` | Number of entries in `m_colBounds` |
+
+## Methods
+
+### isCacheLoading
+
+```cpp
+static bool isCacheLoading();
+```
+
+Returns `true` when `m_iCacheState == STATE_LOADING`. Use this to guard code paths that must not run while cache replay is in progress.
+
+### startCache / endCache
+
+```cpp
+static void startCache();
+static void endCache();
+```
+
+`startCache()` allocates the item arrays and sets `m_iCacheState` to `STATE_SAVING`. From this point forward, every call to `addCacheCol` and `cacheIPLSection` records data rather than discarding it. `endCache()` serializes the accumulated arrays to the file named by `mp_cCacheName` and transitions back to `STATE_NONE`.
+
+### cacheLoadCol
+
+```cpp
+static void cacheLoadCol();
+```
+
+Reads the cache file written by a previous `endCache()` call, deserializes the `CColAccelItem` and `CIplAccelItem` arrays, and replays them into the collision and IPL subsystems. Sets `m_iCacheState` to `STATE_LOADING` for the duration of the replay and clears it on completion.
+
+### addCacheCol
+
+```cpp
+static void addCacheCol(i32 iModelIndex, const CColModel& r_colModel);
+```
+
+During `STATE_SAVING`, appends one `CColAccelItem` to `mp_caccColItems`. Extracts bounds from `r_colModel` and records `iModelIndex`. Does nothing outside `STATE_SAVING`.
+
+### cacheIPLSection / addIPLEntity
+
+```cpp
+static void cacheIPLSection(CEntity** ppListIn, i32 iListSize);
+static void addIPLEntity(CEntity** ppListIn, i32 iListSize, i32 iEntityIndex);
+```
+
+`cacheIPLSection` records a full section of `iListSize` entities from `ppListIn` and appends the section's byte count to `m_iSectionSize`. `addIPLEntity` appends a single entity at `iEntityIndex` within an existing section, filling in model index, LOD index, and the actions bitmask.
+
+### setIplDef / getIplDef
+
+```cpp
+static void setIplDef(i32 index, IplDef rect);
+static IplDef getIplDef(i32 index);
+```
+
+Write and read entries in the `m_iplDefs` array. The `index` must be less than `MAX_IPLDEFS`. These are stored alongside the collision cache and used to quickly restore IPL section metadata on replay.
+
+### addColDef / getColDef
+
+```cpp
+static void addColDef(ColDef colDef);
+static void getColDef(ColDef& colDef);
+```
+
+`addColDef` appends a stripped `CColDefAccelItem` derived from `colDef` to `m_colBounds`. `getColDef` fills the next unread `ColDef` from `m_colBounds` during cache load. Together they cache and restore the bounding and range metadata for each `CColStore` slot without re-scanning disk.
+
+## Cache flow
+
+<Steps>
+  <Step title="Start recording">
+    Call `startCache()`. The state transitions to `STATE_SAVING` and item arrays are allocated.
+  </Step>
+  <Step title="Record collision models">
+    For each model processed during the normal load path, call `addCacheCol(modelIndex, colModel)`. The bounds and index are appended to the internal array.
+  </Step>
+  <Step title="Record IPL entities">
+    For each IPL section, call `cacheIPLSection(list, size)`. Individual entities within the section are registered via `addIPLEntity`. Use `setIplDef` to record the section's `IplDef` metadata.
+  </Step>
+  <Step title="Flush to disk">
+    Call `endCache()`. All accumulated data is serialized to the cache file and the state returns to `STATE_NONE`.
+  </Step>
+  <Step title="Replay on next load">
+    On subsequent world loads, call `cacheLoadCol()`. It reads the cache, sets `STATE_LOADING`, and replays collision and IPL data directly — bypassing all `.col` and `.ipl` parsing. Check `isCacheLoading()` to suppress redundant processing in callees.
+  </Step>
+</Steps>
+
+<Warning>
+The cache is invalidated whenever the underlying `.col` or `.ipl` files change. There is no built-in checksum verification — if the world data changes, delete the cache file and regenerate it by running a full load with `startCache` / `endCache`.
+</Warning>

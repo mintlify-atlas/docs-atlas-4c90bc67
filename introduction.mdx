@@ -1,0 +1,120 @@
+---
+title: "Introduction to the GTA:SA C++ collision detection"
+description: "A reverse-engineered C++ implementation of GTA:SA's collision detection, covering primitives, models, detection, physics, and streaming layers."
+---
+
+GTA:SA Collision is a reverse-engineered C++ implementation of the collision detection subsystem from Grand Theft Auto: San Andreas. The codebase reconstructs the original engine logic with faithful class layouts, verified x86 memory sizes, and annotated function addresses, making it a precise reference for the runtime behavior of every collidable object in the game world.
+
+<Note>
+  All source files are published under `SPDX: LicenseRef-Proprietary`. This codebase is a research and reverse-engineering reference — it is not open-source software. Consult the `LICENSE` file before using any code in a derivative project.
+</Note>
+
+## What this codebase covers
+
+The collision system is divided into five cooperating layers. Each layer has a distinct responsibility, and together they take a model's collision description all the way from a `.col` file on disk to a resolved `CColPoint` describing where two objects touched and how the engine should respond.
+
+<CardGroup cols={2}>
+  <Card title="Collision primitives" icon="shapes" href="/primitives/col-sphere">
+    The atomic building blocks: `CColSphere`, `CColBox`, `CColLine`, `CColTriangle`, and `CColPoint`. Each primitive carries a `ColData` struct encoding surface type, piece type, and per-vertex lighting.
+  </Card>
+  <Card title="Collision models" icon="layer-group" href="/models/col-model">
+    `CColModel` aggregates all primitives for one game model. It owns a `CBoundingBox` for broad-phase rejection and a `CCollisionData` pointer for the actual volume arrays.
+  </Card>
+  <Card title="Detection" icon="atom" href="/detection/collision-class">
+    The static `CCollision` class provides every test and process function — sphere–sphere, sphere–triangle, line–box, line–triangle, line-of-sight, and full model–model checks. Test functions return a `bool`; process functions also fill a `CColPoint`.
+  </Card>
+  <Card title="Physics" icon="wind" href="/detection/physical">
+    `CPhysical` extends `CEntity` with mass, velocity, friction, elasticity, and buoyancy. It calls `CCollision` during `ProcessCollision()` and resolves contacts through `ApplyCollision()` and `ApplySpringCollision()`.
+  </Card>
+  <Card title="Streaming" icon="hard-drive" href="/storage/col-store">
+    `CColStore` manages named `.col` file slots indexed by a quad-tree. It loads and evicts collision data as the player moves through the world, tracking reference counts per slot.
+  </Card>
+  <Card title="Acceleration" icon="bolt" href="/storage/col-accel">
+    `CColAccel` caches pre-parsed `CColModel` and IPL entity data to avoid re-parsing `.col` files on repeated loads, using `CColAccelItem` arrays alongside `CColDefAccelItem` bounding records.
+  </Card>
+</CardGroup>
+
+## Key classes at a glance
+
+<AccordionGroup>
+  <Accordion title="CColSphere, CColBox, CColLine, CColTriangle — primitive types">
+    Every collidable surface in GTA:SA is described by one of four primitive types. `CColSphere` stores a centre `CVector` and radius. `CColBox` stores axis-aligned min/max corners. `CColLine` stores a start and end `CVector` with padding to align to 32 bytes. `CColTriangle` stores three vertex indices into a shared `CollisionVector` array and per-face surface and lighting bytes.
+
+    ```cpp
+    // Each primitive carries ColData for material response
+    class CColSphere : public CSphere   // 0x14 bytes
+    class CColBox    : public CBox      // 0x1C bytes
+    class CColLine                      // 0x20 bytes
+    class CColTriangle                  //  8 bytes (SA target)
+    ```
+  </Accordion>
+
+  <Accordion title="CCollisionData — the volume container">
+    `CCollisionData` holds counted arrays of every primitive type. It owns heap-allocated `CColSphere*`, `CColBox*`, `CColLine*` (or `CColDisk*`), and a `CollisionVector*` vertex pool shared by all triangles. Triangle plane normals are stored separately in a `CColTrianglePlane*` array and computed on demand.
+
+    ```cpp
+    class CCollisionData   // 0x30 bytes (x86)
+    ```
+
+    Bit-flags on the struct control whether disks replace lines (`m_useDisksNotLines`), whether per-sector model sections are active (`m_useColModelSections`), and whether shadow triangles are present (`m_hasShadowTris`).
+  </Accordion>
+
+  <Accordion title="CColModel — the model-level wrapper">
+    `CColModel` inherits `CBoundingBox` (a combined `CBox` + `CSphere`) and adds a `CCollisionData*` pointer, a level byte, and allocation-mode flags. The level byte (`m_level`) records which streaming level owns this model so `CColStore` can evict the right data.
+
+    ```cpp
+    class CColModel : public CBoundingBox   // 0x30 bytes (x86)
+    ```
+  </Accordion>
+
+  <Accordion title="CCollision — the detection engine">
+    `CCollision` is a purely static class. Its `Test*` functions return `bool` and perform cheap early-out checks. Its `Process*` functions additionally write a `CColPoint` result and a depth or ratio scalar. The central entry point for two-object collisions is:
+
+    ```cpp
+    static i32 CCollision::ProcessColModels(
+        const CMatrix& matA, CColModel& colModelA,
+        const CMatrix& matB, CColModel& colModelB,
+        CColPoint* aColPoints,
+        CColPoint* aLineColPoints,
+        f32* aLineRatios,
+        bool bReturnAllCollisions);
+    ```
+  </Accordion>
+
+  <Accordion title="CPhysical — the physics base">
+    `CPhysical` adds dynamics on top of `CEntity`. Key fields include `m_vecMoveSpeed`, `m_vecTurnSpeed`, `m_fMass`, `m_fElasticity`, `m_fAirResistance`, and `m_vecCOM` (centre of mass). The `CPhysicalFlags` bitfield encodes 32 independent behaviour flags — for example `bDoGravity`, `bNotDamagedByCollisions`, and `bUsingSpecialColModel`.
+
+    ```cpp
+    class CPhysical : public CEntity   // 0x138 bytes (x86)
+    ```
+  </Accordion>
+
+  <Accordion title="CColStore — streaming management">
+    `CColStore` wraps a `CPool<ColDef>` for named slot management and a `CQuadTreeNode` for spatial lookup. Each `ColDef` stores the file name, bounding `CRect`, the first and last model indices that belong to that file, a reference count, and load/required flags.
+
+    ```cpp
+    static void CColStore::LoadCollision(CVector posn, bool bLoadScene);
+    static bool CColStore::HasCollisionLoaded(const CVector& posn, i32 areaCode);
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Navigating the documentation
+
+The documentation follows the same layered structure as the code. Start with the primitives if you are new to the system, then move to collision models, and finally to detection and physics once you understand the data representation.
+
+<CardGroup cols={3}>
+  <Card title="Start with primitives" icon="circle" href="/primitives/col-sphere">
+    `CColSphere` is the simplest primitive and the best entry point.
+  </Card>
+  <Card title="Understand models" icon="database" href="/models/collision-data">
+    `CCollisionData` shows how primitives are collected into a single model.
+  </Card>
+  <Card title="See detection in action" icon="bolt" href="/detection/collision-class">
+    `CCollision` ties all the types together into concrete tests.
+  </Card>
+</CardGroup>
+
+<Tip>
+  Every class in this reference includes the `CHECK_SIZE_X86` value from the source as its authoritative byte size. Use these values when writing memory-layout-sensitive code that must match the original GTA:SA binary.
+</Tip>
